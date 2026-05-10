@@ -41,7 +41,7 @@ serve(async (req) => {
       throw new Error('Forbidden: Admin access required')
     }
 
-    const { action, userId, password } = await req.json()
+    const { action, userId, password, visitId } = await req.json()
 
     if (action === 'update-password') {
       if (!userId || !password) {
@@ -57,6 +57,44 @@ serve(async (req) => {
 
       return new Response(
         JSON.stringify({ message: 'Password updated successfully' }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
+      )
+    }
+
+    if (action === 'delete-visit') {
+      if (!visitId) {
+        throw new Error('Missing visitId')
+      }
+
+      // Get visit details to find recording path
+      const { data: visit, error: fetchError } = await supabaseClient
+        .from('visits')
+        .select('recording_path')
+        .eq('id', visitId)
+        .single()
+
+      if (fetchError) throw fetchError
+
+      // Delete from storage if path exists
+      if (visit?.recording_path) {
+        const { error: storageError } = await supabaseClient
+          .storage
+          .from('recordings')
+          .remove([visit.recording_path])
+        // We don't throw here to avoid blocking DB deletion if file is already gone
+        if (storageError) console.error('Storage deletion error:', storageError)
+      }
+
+      // Delete from database
+      const { error: dbError } = await supabaseClient
+        .from('visits')
+        .delete()
+        .eq('id', visitId)
+
+      if (dbError) throw dbError
+
+      return new Response(
+        JSON.stringify({ message: 'Visit deleted successfully' }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
       )
     }

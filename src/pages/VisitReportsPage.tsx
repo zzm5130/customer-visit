@@ -10,8 +10,13 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Search, FileSearch, ArrowRight, Calendar, User,
-  SlidersHorizontal, ChevronLeft, ChevronRight, RefreshCw,
+  SlidersHorizontal, ChevronLeft, ChevronRight, RefreshCw, Trash2,
 } from 'lucide-react';
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import { toast } from 'sonner';
 import { supabase } from '@/db/supabase';
 import type { VisitListItem } from '@/types/types';
 import { format } from 'date-fns';
@@ -90,6 +95,22 @@ const VisitReportsPage: React.FC = () => {
 
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
 
+  const handleDeleteVisit = async (visitId: string) => {
+    try {
+      const { data, error } = await supabase.functions.invoke('admin-api', {
+        body: { action: 'delete-visit', visitId }
+      });
+      if (error) throw error;
+      if (data?.error) throw new Error(data.error);
+
+      toast.success('拜访记录已删除');
+      fetchVisits();
+    } catch (err: any) {
+      console.error('Delete visit error:', err);
+      toast.error(err.message || '删除失败');
+    }
+  };
+
   return (
     <MainLayout>
       <div className="space-y-5">
@@ -166,12 +187,16 @@ const VisitReportsPage: React.FC = () => {
           ) : (
             <div className="divide-y divide-border">
               {/* 列表头 */}
-              <div className="hidden md:grid grid-cols-[1fr_120px_90px_90px_32px] gap-4 px-4 py-2.5 bg-muted/30">
+              <div className={cn(
+                "hidden md:grid gap-4 px-4 py-2.5 bg-muted/30",
+                profile?.role === 'admin' ? "grid-cols-[1fr_120px_90px_90px_32px_32px]" : "grid-cols-[1fr_120px_90px_90px_32px]"
+              )}>
                 <span className="text-xs font-medium text-muted-foreground">客户信息</span>
                 <span className="text-xs font-medium text-muted-foreground">拜访时间</span>
                 <span className="text-xs font-medium text-muted-foreground">状态</span>
                 <span className="text-xs font-medium text-muted-foreground">操作员</span>
                 <span />
+                {profile?.role === 'admin' && <span />}
               </div>
 
               {visits.map(visit => {
@@ -181,49 +206,90 @@ const VisitReportsPage: React.FC = () => {
                   : format(new Date(visit.created_at), 'M月d日', { locale: zhCN }) + ' (创建)';
 
                 return (
-                  <Link
-                    key={visit.id}
-                    to={`/visits/reports/${visit.id}`}
-                    className="flex flex-col md:grid md:grid-cols-[1fr_120px_90px_90px_32px] gap-2 md:gap-4 px-4 py-3.5 hover:bg-muted/30 transition-colors items-start md:items-center"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-medium text-sm text-foreground">{visit.customer_name}</span>
-                        {visit.customer_industry && (
-                          <Badge variant="secondary" className="text-xs">{visit.customer_industry}</Badge>
+                  <div key={visit.id} className="relative group">
+                    <Link
+                      to={`/visits/reports/${visit.id}`}
+                      className={cn(
+                        "flex flex-col md:grid gap-2 md:gap-4 px-4 py-3.5 hover:bg-muted/30 transition-colors items-start md:items-center",
+                        profile?.role === 'admin' ? "md:grid-cols-[1fr_120px_90px_90px_32px_32px]" : "md:grid-cols-[1fr_120px_90px_90px_32px]"
+                      )}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-medium text-sm text-foreground">{visit.customer_name}</span>
+                          {visit.customer_industry && (
+                            <Badge variant="secondary" className="text-xs">{visit.customer_industry}</Badge>
+                          )}
+                        </div>
+                        {visit.keywords && visit.keywords.length > 0 && (
+                          <div className="flex gap-1 mt-1 flex-wrap">
+                            {visit.keywords.slice(0, 3).map((kw, i) => (
+                              <span key={i} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                                {kw}
+                              </span>
+                            ))}
+                          </div>
                         )}
                       </div>
-                      {visit.keywords && visit.keywords.length > 0 && (
-                        <div className="flex gap-1 mt-1 flex-wrap">
-                          {visit.keywords.slice(0, 3).map((kw, i) => (
-                            <span key={i} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                              {kw}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
 
-                    <div className="flex items-center gap-1 text-xs text-muted-foreground whitespace-nowrap">
-                      <Calendar size={11} />
-                      {visitDate}
-                    </div>
+                      <div className="flex items-center gap-1 text-xs text-muted-foreground whitespace-nowrap">
+                        <Calendar size={11} />
+                        {visitDate}
+                      </div>
 
-                    <div>
-                      <span className={cn('text-xs px-2 py-0.5 rounded font-medium', statusConf.className)}>
-                        {statusConf.label}
-                      </span>
-                    </div>
+                      <div>
+                        <span className={cn('text-xs px-2 py-0.5 rounded font-medium', statusConf.className)}>
+                          {statusConf.label}
+                        </span>
+                      </div>
 
-                    <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <User size={11} />
-                      <span className="truncate max-w-[72px]">
-                        {visit.profiles?.full_name || visit.profiles?.username || '-'}
-                      </span>
-                    </div>
+                      <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <User size={11} />
+                        <span className="truncate max-w-[72px]">
+                          {visit.profiles?.full_name || visit.profiles?.username || '-'}
+                        </span>
+                      </div>
 
-                    <ArrowRight size={14} className="text-muted-foreground shrink-0 hidden md:block" />
-                  </Link>
+                      <ArrowRight size={14} className="text-muted-foreground shrink-0 hidden md:block" />
+                    </Link>
+
+                    {profile?.role === 'admin' && (
+                      <div className="absolute right-2 md:right-4 top-2 md:top-1/2 md:-translate-y-1/2 z-10">
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-8 w-8 p-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                              onClick={(e) => e.preventDefault()}
+                            >
+                              <Trash2 size={14} />
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg">
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>确认删除记录？</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                此操作将永久删除与该客户 {visit.customer_name} 的拜访记录、录音文件及AI生成的报告，且无法恢复。
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel onClick={(e) => e.stopPropagation()}>取消</AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteVisit(visit.id);
+                                }}
+                                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                              >
+                                确认删除
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
             </div>
