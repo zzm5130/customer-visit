@@ -18,15 +18,16 @@ serve(async (req) => {
     )
 
     // Get the caller's auth context
-    const authHeader = req.headers.get('Authorization')!
-    const tempClient = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
-      { global: { headers: { Authorization: authHeader } } }
-    )
-    const { data: { user: caller }, error: authError } = await tempClient.auth.getUser()
+    const authHeader = req.headers.get('Authorization')
+    if (!authHeader) {
+      throw new Error('Unauthorized: Missing header')
+    }
+
+    // Use service role client to verify the user's JWT
+    const { data: { user: caller }, error: authError } = await supabaseClient.auth.getUser(authHeader.replace('Bearer ', ''))
 
     if (authError || !caller) {
+      console.error('Auth error:', authError)
       throw new Error('Unauthorized')
     }
 
