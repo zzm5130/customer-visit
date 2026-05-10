@@ -1541,3 +1541,3961 @@ File overwritten successfully at: /workspace/app-bcuf7wultloh/src/contexts/AuthC
 COMMAND:
 find /workspace/app-bcuf7wultloh/src/components -type f | head -30 && ls /workspace/app-bcuf7wultloh/src/components/
 </action>
+<action>
+**MessageAction** (source=EventSource.USER)
+CONTENT: 立即创作
+</action>
+<action>
+**RecallAction**
+QUERY: 立即创作
+</action>
+<action>
+**MCPAction**
+NAME: get_pre_code_requirements
+ARGUMENTS: {'request': ['login', 'image_upload'], 'appId': 'app-bcuf7wultloh', 'userId': 'user-7j07vypyjmrk', 'appType': 'Web'}
+</action>
+<observation>
+**MCPObservation**
+NAME: get_pre_code_requirements
+RESULTS: <LOGIN_REQUIREMENTS>
+principles:
+Use Supabase Auth for all login/registration.
+Ensure a closed loop: login and logout work; data permissions don’t conflict with features.
+Required items: must be complete and verified; higher priority than user requests.
+Recommended items: also to be done, but lower priority than user requests.
+Protect data security while maximizing access for guests and regular users.
+
+Required:
+1. Design a login page.
+    - Include registration
+    - Add checkboxes for the User Agreement and Privacy Policy.
+        - Sample User Agreement & Privacy Policy (Brief one sentence)
+        - Inform the user in the finish summary. <user-reminder>Please modify the User Agreement & Privacy Policy yourself to mitigate legal risks.<user-reminder/>
+2. Auto-sync new users to profiles on INSERT.
+   - Set search_path = public to resolve types correctly.
+   - The following template has been validated as a best practice and is compatible with any business requirements. Only the custom registration fields to be synchronized in handle_new_user may be modified. No other changes are allowed, and no additional trigger logic may be added to the auth table.
+Template:
+```sql
+CREATE TYPE public.user_role AS ENUM ('user', 'admin');
+
+CREATE FUNCTION handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+-- Insert a profile synced with fields collected at signup.
+INSERT INTO public.profiles (id, email, phone, role)
+VALUES (
+  NEW.id,
+  NEW.email,
+  NEW.phone,
+  'user'::public.user_role
+);
+RETURN NEW;
+END;
+$$;
+
+-- Do not add any additional triggers to the auth table.
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW
+  EXECUTE FUNCTION handle_new_user();
+```
+3. AuthContext / RouteGuard:
+    - Always add AuthProvider in @/App.tsx so all pages can access login state (e.g. navbar login/logout).
+    - RouteGuard is optional: only add it when authentication is required for most routes.
+      - If the app pattern is "only admin needs login, other routes are public", do NOT add RouteGuard. Its default-block-all interception (whitelist-only) will break the app for regular users.
+      - When RouteGuard IS needed: review @/contexts/AuthContext.tsx and @/components/common/RouteGuard.tsx, do not create new files. Check PUBLIC_ROUTES and add RouteGuard in @/App.tsx.
+4. Show login status and login/logout in navbar(add header in app.tsx); if without a navbar, add a login/logout button, login status on the home page.
+5. After a successful login, the user must be redirected to a non-login page.
+6. If roles/admin needed:
+   - AI must create one example admin account with a randomly generated, strong password (16+ chars, mixed case + digits + symbols). Never use simple passwords unless the user explicitly specifies one. Output the credentials in the finish summary.
+   - Account creation flow (two-step, fully automated via script):
+     1. Register the account using the normal signUp API (triggers handle_new_user to insert the profiles row with role='user').
+     2. Immediately after, use the service_role key (Supabase admin client) to update the profiles table and set role='admin'. Do NOT ask the user to change the role manually.
+     Example script pattern:
+     ```javascript
+     const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY); // service_role key, server-side only
+     const { data: authData } = await supabase.auth.signUp({ email: `${username}@miaoda.com`, password });
+     await supabaseAdmin.from('profiles').update({ role: 'admin' }).eq('id', authData.user.id);
+     ```
+   - The script must be executed automatically as part of the setup; log the resulting credentials (username + password) to the console.
+   - Admin sees Admin entry in navbar.
+   - Admin page: manage user roles (edit others).
+   - profiles permissions:
+     1. Create helper `has_role` to prevent infinite recursion detected in policy for relation "profiles"
+     2. Admins have full access
+     3. Users can view own data
+     4. Users can edit own data except `role`
+     5. Use `public_profiles` view for shareable info
+     Here is an example:
+```sql
+CREATE OR REPLACE FUNCTION has_role(uid uuid, role_name text)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM profiles p
+    WHERE p.id = uid AND p.role = role_name::user_role
+  );
+$$;
+
+-- Profiles policies
+CREATE POLICY "Admins have full access to profiles" ON profiles
+  FOR ALL TO authenticated USING (has_role(auth.uid(), 'admin'));
+
+CREATE POLICY "Users can view their own profile" ON profiles
+  FOR SELECT TO authenticated USING (auth.uid() = id);
+
+CREATE POLICY "Users can update their own profile" ON profiles
+  FOR UPDATE TO authenticated USING (auth.uid() = id)
+  WITH CHECK (role IS NOT DISTINCT FROM (SELECT role FROM profiles WHERE id = auth.uid()));
+
+CREATE VIEW public_profiles AS
+  SELECT id, role FROM profiles;
+```
+
+7. Anonymous login (if needed):
+   - On first visit, generate a UUID v4 as the anonymous credential ID and persist it in localStorage under the key `anon_credential_id`. This is NOT the Supabase auth.uid — it is an app-level identifier.
+   - Create a table `anon_credential_map (credential_id uuid PRIMARY KEY, auth_uid uuid REFERENCES profiles(id))` to store the mapping. RLS: only the Edge Function's service-role key may read/write this table.
+   - Create a Supabase Edge Function `anon-auth` that:
+     1. Accepts `{ credential_id: string }` in the request body.
+     2. Queries `anon_credential_map` for the given credential_id.
+     3. If found: calls `supabaseAdmin.auth.admin.generateLink({ type: 'magiclink', email })` to generate a token for the existing user.
+     4. If not found: first calls `supabaseAdmin.auth.admin.createUser({ email: 'anon_<credential_id>@miaoda.com', password: <random strong password>, email_confirm: true })` to register the user, inserts the credential_id → auth.uid row into `anon_credential_map`, then calls `generateLink` to generate a token.
+     5. Returns `{ hashed_token }` (from `data.properties.hashed_token`) to the client.
+   - On the client, call `supabase.auth.verifyOtp({ token_hash: hashed_token, type: 'magiclink' })` to activate the session.
+   - The Edge Function must use the service-role key (server-side only, never exposed to the client).
+   - The credential_id must never be sent to any third party and must only be used for this Edge Function call.
+   - Note: the `on_auth_user_created` trigger will fire for anonymous users too; ensure the profiles table allows null email and phone.
+
+
+Recommended:
+1. If no method specified, use username + password.
+2. Login must check `supabase_verification`; show phone/email verification UI if enabled.
+3. If no verification is needed, auto-login after signup and go back to the last page.
+
+
+Tech limits:
+1. Unregistered users can’t set roles; register first via signUp, then use the service_role key to update role programmatically.
+2. Single account system; multi-device handled by roles.
+3. Password changes/add accounts via Edge Functions (do not use trigger for auth→profiles).
+4. Do not insert into profiles directly; only trigger sync adds rows.
+5. Only profiles.id may reference auth.users(id); other tables must reference profiles(id).
+6. use the `supabase_verification` tool to set up verification
+7. Only username in email field; no phone.
+8. Do not allow login with both email and username. Use username. Store email in the profiles table.
+9. AI-registered or AI-created accounts must use randomly generated, strong passwords (16+ chars, mixed uppercase + lowercase + digits + symbols). Never use simple or guessable passwords unless the user explicitly specifies the password.
+
+Finish Summary Requirements (MANDATORY):
+In the final reply to the user, you MUST include a summary section covering all applicable items:
+1. List all login methods implemented (e.g., username-password, Google SSO, phone OTP, email).
+2. Admin roles (if created): output the example admin account credentials (username + password) logged by the setup script.
+3. User Agreement & Privacy Policy: remind the user — "Please modify the User Agreement & Privacy Policy yourself to mitigate legal risks."
+4. Verification status: if verification was disabled via `supabase_verification`, inform the user that verification is currently disabled and explain how to re-enable it if needed.
+5. Anonymous login (if implemented): explain to the user how anonymous sessions work and that anonymous credentials are persisted in localStorage.
+6. Any other manual steps the user must perform (Supabase Dashboard changes, environment variable settings, role updates, etc.).
+
+Auth notes:
+1. Username + password:
+  - simulate email/password with @miaoda.com
+  - use `supabase_verification` tool to disable email verification
+  - Only letters, digits, and _ are allowed in usernames.
+2. Google SSO:
+```
+const { data, error } = await client.auth.signInWithSSO({
+  domain: 'miaoda-gg.com',
+  options: { redirectTo: window.location.origin },
+});
+window.open(data.url, '_self');
+```
+Do not use OAuth.
+3. Phone OTP: Use signInWithOtp() to send OTP, verifyOtp() to login.; no other SMS APIs.
+4. Phone + password (verification ON): Use signUp(phone) to send OTP (Password required), verifyOtp() to register.
+5. Email + password (verification ON): pass emailRedirectTo to signup (default window.location.origin).
+</LOGIN_REQUIREMENTS>
+<IMAGE_UPLOAD_REQUIREMENTS>
+* IMAGE REQUIREMENT DETECTION:
+  - Treat the system as requiring image upload functionality when the user explicitly or implicitly mentions: "image", "picture", "photo", "avatar", "banner", "thumbnail", "upload image", "manage pictures".
+  - If any table contains image fields or any feature requires uploading, editing, or managing images, an **image upload subsystem** must be included.
+
+* IMAGE PLATFORM & ARCHITECTURE RULES:
+  1. **Mandatory Supabase Storage**
+     - All image uploads must use **Supabase Storage** buckets.
+     - Buckets must be created using `supabase_apply_migration`.
+  2. **Bucket Policies**
+     - Images usually don’t require access control.
+     - For private scenarios, generate a signed URL when loading images.
+  3. **File Size & Format**
+     - By default, the maximum upload size must be enforced according to the bucket configuration (default: **1 MB**).
+     - If users attempt to upload files exceeding the limit, an **automatic compression strategy must be triggered**:
+       - Convert images to **WEBP** format.
+       - Restrict maximum resolution to **1080p** (preserve aspect ratio).
+       - Apply quality setting = **0.8** and auto-degrade iteratively until the file size is below 1 MB.
+     - Supported formats for upload: JPEG, PNG, GIF, WEBP, AVIF.
+     - Filename Rules: Ensure that the uploaded file's name contains only English letters and numbers.
+* ADDITIONAL FRONTEND INTEGRATION RULES:
+  - A clear **Upload Button** must be designed.
+    - Display **upload progress bar** in real-time.
+    - Notify users explicitly on **upload success** or **failure**.
+    - If compression is applied:
+      - Inform users that the image was compressed automatically.
+      - Display the **final file size** after compression in the confirmation message.
+
+* IMAGE IMPLEMENTATION WORKFLOW
+### Step 1: Initialize Supabase
+- Ensure Supabase is properly initialized and connected to the frontend.
+
+### Step 2: Bucket & Database Setup
+- Use `supabase_apply_migration` to create a dedicated image bucket.
+- Modify relevant tables to store image URLs/paths.
+- Apply appropriate policies for read/write access.
+
+### Step 3: File Validation
+- Validate file size, type, and dimensions before upload.
+- If the file exceeds the maximum allowed size, trigger the **automatic compression strategy** to reduce size to under 1 MB.
+
+### Step 4: Frontend Implementation
+- Implement the upload button with progress bar.
+- Show **upload success/failure notification**.
+- If compression was applied, notify the user and show the **compressed file size**.
+
+### Step 5: User Guidance
+- Provide clear instructions to the user about supported file formats and maximum size.
+- Inform users about the automatic compression mechanism.
+
+</IMAGE_UPLOAD_REQUIREMENTS>
+</observation>
+<observation>
+**CmdOutputObservation (source=EventSource.AGENT, exit code=0, metadata={
+  "exit_code": 0,
+  "pid": -1,
+  "username": null,
+  "hostname": null,
+  "working_dir": "/workspace/app-bcuf7wultloh",
+  "py_interpreter_path": null,
+  "prefix": "",
+  "suffix": "\n[The command completed with exit code 0.]"
+})**
+--BEGIN AGENT OBSERVATION--
+/workspace/app-bcuf7wultloh/src/components/dropzone.tsx
+/workspace/app-bcuf7wultloh/src/components/common/IntersectObserver.tsx
+/workspace/app-bcuf7wultloh/src/components/common/PageMeta.tsx
+/workspace/app-bcuf7wultloh/src/components/common/RouteGuard.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/slider.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/carousel.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/button.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/radio-group.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/select.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/skeleton.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/breadcrumb.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/avatar.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/drawer.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/context-menu.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/textarea.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/label.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/toggle-group.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/scroll-area.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/sonner.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/video.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/table.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/calendar.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/pagination.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/multi-select.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/accordion.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/separator.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/resizable.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/input-otp.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/sheet.tsx
+/workspace/app-bcuf7wultloh/src/components/ui/tooltip.tsx
+common
+dropzone.tsx
+ui
+[The command completed with exit code 0.]
+[Current working directory: /workspace/app-bcuf7wultloh]
+--END AGENT OBSERVATION--
+</observation>
+<action>
+FileReadAction(path='/workspace/app-bcuf7wultloh/src/components/common/RouteGuard.tsx', start=0, end=-1, thought='', action=<ActionType.READ: 'read'>, security_risk=None, impl_source='oh_aci', view_range=None, user_hidden=False)
+</action>
+<observation>
+[Read from /workspace/app-bcuf7wultloh/src/components/common/RouteGuard.tsx is successful.]
+Here's the result of running `cat -n` on the file: /workspace/app-bcuf7wultloh/src/components/common/RouteGuard.tsx:
+     1 import { useEffect } from 'react';
+     2 import { useNavigate, useLocation } from 'react-router-dom';
+     3 import { useAuth } from '@/contexts/AuthContext';
+     4 import { routes } from '@/routes';
+     5 
+     6 interface RouteGuardProps {
+     7   children: React.ReactNode;
+     8 }
+     9 
+    10 // System-level public routes (no need to register in routes.tsx)
+    11 const SYSTEM_PUBLIC_ROUTES = ['/login', '/403', '/404'];
+    12 
+    13 // Derived from routes.tsx: all routes marked with public: true
+    14 const routePublicPaths = routes.filter(r => r.public).map(r => r.path);
+    15 
+    16 const PUBLIC_ROUTES = [...SYSTEM_PUBLIC_ROUTES, ...routePublicPaths];
+    17 
+    18 function matchPublicRoute(path: string, patterns: string[]) {
+    19   return patterns.some(pattern => {
+    20     if (pattern.includes('*')) {
+    21       const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
+    22       return regex.test(path);
+    23     }
+    24     return path === pattern;
+    25   });
+    26 }
+    27 
+    28 export function RouteGuard({ children }: RouteGuardProps) {
+    29   const { user, loading } = useAuth();
+    30   const navigate = useNavigate();
+    31   const location = useLocation();
+    32 
+    33   useEffect(() => {
+    34     if (loading) return;
+    35 
+    36     const isPublic = matchPublicRoute(location.pathname, PUBLIC_ROUTES);
+    37 
+    38     if (!user && !isPublic) {
+    39       navigate('/login', { state: { from: location.pathname }, replace: true });
+    40     }
+    41   }, [user, loading, location.pathname, navigate]);
+    42 
+    43   if (loading) {
+    44     return (
+    45       <div className="flex items-center justify-center min-h-screen">
+    46         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
+    47       </div>
+    48     );
+    49   }
+    50 
+    51   return <>{children}</>;
+    52 }
+
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/index.css]
+Thought: Now let me update the index.css with the design system colors:
+Command: str_replace
+Old String: ```
+/* stylelint-disable */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Definition of the design system. All colors, gradients, fonts, etc should be defined here.
+All colors MUST be HSL.
+*/
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+    --destructive: 0 84.2% 60.2%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 222.2 84% 4.9%;
+    --chart-1: 12 76% 61%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+    --destructive-foreground: 210 40% 98%;
+  }
+
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222.2 84% 4.9%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 210 40% 98%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 217.2 32.6% 17.5%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --border: 217.2 32.6% 17.5%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 212.7 26.8% 83.9%;
+    --chart-1: 220 70% 50%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+    --destructive-foreground: 210 40% 98%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+```
+New String: ```
+/* stylelint-disable */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --radius: 0.25rem;
+    /* 浅灰白背景 */
+    --background: 220 20% 97%;
+    --foreground: 220 30% 10%;
+    /* 卡片白色 */
+    --card: 0 0% 100%;
+    --card-foreground: 220 30% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 30% 10%;
+    /* 主色：深邃蓝 #1D4ED8 */
+    --primary: 224 72% 48%;
+    --primary-foreground: 0 0% 100%;
+    /* 次要色 */
+    --secondary: 220 20% 94%;
+    --secondary-foreground: 220 30% 20%;
+    --muted: 220 15% 94%;
+    --muted-foreground: 220 10% 46%;
+    --accent: 220 15% 92%;
+    --accent-foreground: 220 30% 20%;
+    /* 危险/录音红 #DC2626 */
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    /* 边框 */
+    --border: 220 13% 90%;
+    --input: 220 13% 90%;
+    --ring: 224 72% 48%;
+    /* 状态色 */
+    --success: 142 71% 35%;
+    --warning: 38 92% 45%;
+    --info: 199 89% 40%;
+    /* 图表色 */
+    --chart-1: 224 72% 48%;
+    --chart-2: 142 71% 35%;
+    --chart-3: 38 92% 45%;
+    --chart-4: 280 65% 52%;
+    --chart-5: 199 89% 40%;
+    /* 侧边栏 */
+    --sidebar-background: 224 40% 18%;
+    --sidebar-foreground: 220 20% 88%;
+    --sidebar-primary: 224 72% 60%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 224 35% 26%;
+    --sidebar-accent-foreground: 220 20% 95%;
+    --sidebar-border: 224 30% 25%;
+    --sidebar-ring: 224 72% 60%;
+    /* 教育色（保留兼容） */
+    --education-blue: 224 72% 48%;
+    --education-green: 142 71% 35%;
+  }
+
+  .dark {
+    --background: 224 30% 10%;
+    --foreground: 220 20% 92%;
+    --card: 224 28% 13%;
+    --card-foreground: 220 20% 92%;
+    --popover: 224 28% 13%;
+    --popover-foreground: 220 20% 92%;
+    --primary: 224 72% 60%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 224 24% 20%;
+    --secondary-foreground: 220 20% 85%;
+    --muted: 224 24% 20%;
+    --muted-foreground: 220 15% 58%;
+    --accent: 224 24% 22%;
+    --accent-foreground: 220 20% 88%;
+    --destructive: 0 62% 42%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 224 24% 22%;
+    --input: 224 24% 22%;
+    --ring: 224 72% 60%;
+    --success: 142 65% 45%;
+    --warning: 38 85% 55%;
+    --info: 199 75% 50%;
+    --chart-1: 224 72% 60%;
+    --chart-2: 142 65% 45%;
+    --chart-3: 38 85% 55%;
+    --chart-4: 280 60% 62%;
+    --chart-5: 199 75% 50%;
+    --sidebar-background: 224 35% 8%;
+    --sidebar-foreground: 220 20% 85%;
+    --sidebar-primary: 224 72% 60%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 224 30% 16%;
+    --sidebar-accent-foreground: 220 20% 92%;
+    --sidebar-border: 224 28% 18%;
+    --sidebar-ring: 224 72% 60%;
+    --education-blue: 224 72% 60%;
+    --education-green: 142 65% 45%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 6px;
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 3px;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+}
+
+@layer utilities {
+  .gradient-text {
+    background: linear-gradient(135deg, hsl(var(--primary)) 0%, hsl(224, 90%, 65%) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  /* 录音波形动画 */
+  .wave-bar {
+    display: inline-block;
+    width: 3px;
+    background: hsl(var(--destructive));
+    border-radius: 2px;
+    animation: wave 0.8s ease-in-out infinite;
+  }
+  .wave-bar:nth-child(2) { animation-delay: 0.1s; }
+  .wave-bar:nth-child(3) { animation-delay: 0.2s; }
+  .wave-bar:nth-child(4) { animation-delay: 0.3s; }
+  .wave-bar:nth-child(5) { animation-delay: 0.4s; }
+  @keyframes wave {
+    0%, 100% { transform: scaleY(0.4); opacity: 0.6; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
+}
+```
+
+</action>
+<observation>
+The file /workspace/app-bcuf7wultloh/src/index.css has been edited.
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/components/layouts/MainLayout.tsx]
+Thought: Now let's create the layout component and update the app structure:
+Command: create
+Created File with Text:
+```
+import React, { useState } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { Button } from '@/components/ui/button';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Sheet, SheetContent, SheetTrigger } from '@/components/ui/sheet';
+import {
+  LayoutDashboard,
+  ClipboardList,
+  Mic,
+  FileSearch,
+  Users,
+  BarChart3,
+  Menu,
+  LogOut,
+  ChevronRight,
+  Briefcase,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { toast } from 'sonner';
+
+interface NavItem {
+  name: string;
+  path: string;
+  icon: React.ReactNode;
+  adminOnly?: boolean;
+}
+
+const navItems: NavItem[] = [
+  { name: '工作台', path: '/', icon: <LayoutDashboard size={18} /> },
+  { name: '拜访前准备', path: '/visits/prepare', icon: <ClipboardList size={18} /> },
+  { name: '拜访中记录', path: '/visits/record', icon: <Mic size={18} /> },
+  { name: '拜访报告', path: '/visits/reports', icon: <FileSearch size={18} /> },
+  { name: '用户管理', path: '/admin/users', icon: <Users size={18} />, adminOnly: true },
+  { name: '数据统计', path: '/admin/stats', icon: <BarChart3 size={18} />, adminOnly: true },
+];
+
+function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
+  const location = useLocation();
+  const { profile } = useAuth();
+
+  const visibleItems = navItems.filter(item => !item.adminOnly || profile?.role === 'admin');
+
+  return (
+    <div className="flex flex-col h-full bg-sidebar text-sidebar-foreground">
+      {/* Logo */}
+      <div className="flex items-center gap-2 px-5 py-5 border-b border-sidebar-border">
+        <div className="w-8 h-8 rounded bg-sidebar-primary flex items-center justify-center">
+          <Briefcase size={16} className="text-sidebar-primary-foreground" />
+        </div>
+        <div>
+          <div className="text-sm font-semibold text-sidebar-primary-foreground">客拜管理系统</div>
+          <div className="text-xs text-sidebar-foreground/60">销售助手</div>
+        </div>
+      </div>
+
+      {/* 导航项 */}
+      <nav className="flex-1 px-3 py-4 space-y-0.5">
+        {profile?.role === 'admin' && (
+          <div className="px-2 pb-2 pt-1 text-xs font-medium text-sidebar-foreground/50 uppercase tracking-wider">
+            常用功能
+          </div>
+        )}
+        {visibleItems.filter(i => !i.adminOnly).map(item => (
+          <Link
+            key={item.path}
+            to={item.path}
+            onClick={onNavigate}
+            className={cn(
+              'flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors duration-150',
+              location.pathname === item.path || (item.path !== '/' && location.pathname.startsWith(item.path))
+                ? 'bg-sidebar-primary text-sidebar-primary-foreground font-medium'
+                : 'text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'
+            )}
+          >
+            {item.icon}
+            <span>{item.name}</span>
+          </Link>
+        ))}
+
+        {profile?.role === 'admin' && (
+          <>
+            <div className="px-2 pb-2 pt-4 text-xs font-medium text-sidebar-foreground/50 uppercase tracking-wider">
+              管理后台
+            </div>
+            {visibleItems.filter(i => i.adminOnly).map(item => (
+              <Link
+                key={item.path}
+                to={item.path}
+                onClick={onNavigate}
+                className={cn(
+                  'flex items-center gap-3 px-3 py-2.5 rounded text-sm transition-colors duration-150',
+                  location.pathname === item.path
+                    ? 'bg-sidebar-primary text-sidebar-primary-foreground font-medium'
+                    : 'text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'
+                )}
+              >
+                {item.icon}
+                <span>{item.name}</span>
+              </Link>
+            ))}
+          </>
+        )}
+      </nav>
+
+      {/* 用户信息 */}
+      <div className="px-3 pb-4 border-t border-sidebar-border pt-3">
+        <div className="flex items-center gap-2.5 px-2 py-2">
+          <Avatar className="h-7 w-7">
+            <AvatarFallback className="bg-sidebar-primary text-sidebar-primary-foreground text-xs">
+              {profile?.full_name?.charAt(0) || profile?.username?.charAt(0) || 'U'}
+            </AvatarFallback>
+          </Avatar>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-sidebar-foreground truncate">
+              {profile?.full_name || profile?.username}
+            </div>
+            <div className="text-xs text-sidebar-foreground/50">
+              {profile?.role === 'admin' ? '管理员' : '普通用户'}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+interface MainLayoutProps {
+  children: React.ReactNode;
+}
+
+export function MainLayout({ children }: MainLayoutProps) {
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const { profile, signOut } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSignOut = async () => {
+    await signOut();
+    toast.success('已退出登录');
+    navigate('/login');
+  };
+
+  return (
+    <div className="flex min-h-screen w-full bg-background">
+      {/* 桌面侧边栏 */}
+      <aside className="hidden lg:flex flex-col w-56 shrink-0 border-r border-sidebar-border">
+        <SidebarContent />
+      </aside>
+
+      {/* 主内容区 */}
+      <div className="flex-1 min-w-0 overflow-x-hidden flex flex-col">
+        {/* 顶部栏 */}
+        <header className="sticky top-0 z-40 flex items-center justify-between h-14 px-4 bg-card border-b border-border">
+          <div className="flex items-center gap-3">
+            {/* 移动端汉堡菜单 */}
+            <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+              <SheetTrigger asChild>
+                <Button variant="ghost" size="icon" className="lg:hidden text-foreground hover:bg-accent">
+                  <Menu size={20} />
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="left" className="p-0 w-56 bg-sidebar">
+                <SidebarContent onNavigate={() => setMobileOpen(false)} />
+              </SheetContent>
+            </Sheet>
+
+            <div className="flex items-center gap-1 text-xs text-muted-foreground lg:hidden">
+              <Briefcase size={14} className="text-primary" />
+              <span className="font-medium text-foreground">客拜管理系统</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" className="flex items-center gap-2 px-2 text-sm text-foreground hover:bg-accent">
+                  <Avatar className="h-7 w-7">
+                    <AvatarFallback className="bg-primary text-primary-foreground text-xs">
+                      {profile?.full_name?.charAt(0) || profile?.username?.charAt(0) || 'U'}
+                    </AvatarFallback>
+                  </Avatar>
+                  <span className="hidden md:block max-w-[120px] truncate">
+                    {profile?.full_name || profile?.username}
+                  </span>
+                  <ChevronRight size={14} className="opacity-50" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-44">
+                <div className="px-3 py-2">
+                  <div className="text-sm font-medium truncate">{profile?.full_name || profile?.username}</div>
+                  <div className="text-xs text-muted-foreground">{profile?.role === 'admin' ? '管理员' : '普通用户'}</div>
+                </div>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={handleSignOut} className="text-destructive focus:text-destructive cursor-pointer">
+                  <LogOut size={14} className="mr-2" />
+                  退出登录
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </header>
+
+        {/* 页面内容 */}
+        <main className="flex-1 p-4 md:p-6">
+          {children}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/components/layouts/MainLayout.tsx
+
+<system-reminder>
+Here is the no state version of your todo list:
+
+1. 初始化Supabase并配置数据库Schema  *high*
+  - supabase_init
+  - 禁用邮箱验证
+  - 创建profiles, visits, recordings, reports表
+  - 设置RLS策略
+  - 创建管理员账号
+2. 创建并部署Edge Functions  *high*
+  - generate-text: 调用文心大模型生成PPT内容和报告
+  - transcribe-audio: 调用语音识别API转文字
+3. 配置项目样式和基础结构  *high*
+  - 更新index.css（工具理性风，深蓝色主题）
+  - 配置tailwind.config.js
+  - 更新App.tsx（路由+AuthProvider）
+  - 创建routes.tsx
+  - 创建Layout组件
+4. 实现用户认证页面  *high*
+  - 登录页（/login）
+  - 注册页（/register）
+  - AuthContext
+  - RouteGuard
+5. 实现首页和拜访前准备页  *medium*
+  - 首页（三个核心功能入口）
+  - 拜访前准备页（客户资料输入+AI PPT生成）
+  - PPT预览和下载
+6. 实现拜访中记录页  *medium*
+  - 录音功能（开始/暂停/停止）
+  - 录音文件上传
+  - 拜访信息填写表单
+7. 实现拜访后查询页面  *medium*
+  - 报告列表（支持搜索过滤）
+  - 报告详情（文字稿+结构化报告+录音播放）
+  - AI整理报告功能
+8. 实现管理后台页面  *medium*
+  - 用户管理（查看/修改角色/禁用启用）
+  - 拜访数据统计
+9. 执行lint检查并修复问题  *high*
+  - 运行 npm run lint
+  - 修复所有lint错误
+</system-reminder>
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/LoginPage.tsx]
+Thought: Now create the login and register pages:
+Command: create
+Created File with Text:
+```
+import React, { useState } from 'react';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Card, CardContent, CardFooter } from '@/components/ui/card';
+import { Briefcase, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
+
+const LoginPage: React.FC = () => {
+  const { signIn } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const from = (location.state as { from?: string })?.from || '/';
+
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!username.trim() || !password.trim()) {
+      toast.error('请填写用户名和密码');
+      return;
+    }
+    setLoading(true);
+    const { error } = await signIn(username.trim(), password);
+    setLoading(false);
+    if (error) {
+      toast.error(error);
+    } else {
+      navigate(from, { replace: true });
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background px-4">
+      <div className="w-full max-w-sm">
+        {/* Logo */}
+        <div className="flex flex-col items-center mb-8">
+          <div className="w-12 h-12 rounded bg-primary flex items-center justify-center mb-3">
+            <Briefcase size={24} className="text-primary-foreground" />
+          </div>
+          <h1 className="text-xl font-semibold text-foreground">客户拜访管理系统</h1>
+          <p className="text-sm text-muted-foreground mt-1">销售团队智能拜访助手</p>
+        </div>
+
+        <Card className="border border-border shadow-none">
+          <form onSubmit={handleSubmit}>
+            <CardContent className="pt-6 pb-4 space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="username" className="text-sm font-normal">用户名</Label>
+                <Input
+                  id="username"
+                  type="text"
+                  placeholder="请输入用户名"
+                  value={username}
+                  onChange={e => setUsername(e.target.value)}
+                  autoComplete="username"
+                  disabled={loading}
+                  className="px-3"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="password" className="text-sm font-normal">密码</Label>
+                <div className="relative">
+                  <Input
+                    id="password"
+                    type={showPassword ? 'text' : 'password'}
+                    placeholder="请输入密码"
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    autoComplete="current-password"
+                    disabled={loading}
+                    className="px-3 pr-10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    tabIndex={-1}
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+            </CardContent>
+
+            <CardFooter className="flex-col gap-3 pt-0 pb-6 px-6">
+              <Button type="submit" className="w-full" disabled={loading}>
+                {loading && <Loader2 size={16} className="mr-2 animate-spin" />}
+                登录
+              </Button>
+              <p className="text-xs text-muted-foreground text-center">
+                还没有账号？
+                <Link to="/register" className="text-primary hover:underline ml-1">
+                  立即注册
+                </Link>
+              </p>
+              <p className="text-xs text-muted-foreground/70 text-center leading-relaxed">
+                登录即表示您同意我们的
+                <span className="underline cursor-pointer">用户协议</span>
+                和
+                <span className="underline cursor-pointer">隐私政策</span>
+              </p>
+            </CardFooter>
+          </form>
+        </Card>
+      </div>
+    </div>
+  );
+};
+
+export default LoginPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/LoginPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/RegisterPage.tsx]
+Thought: 
+Command: create
+Created File with Text:
+```
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Card, CardContent, CardFooter } from '@/components/ui/card';
+import { Briefcase, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
+
+const RegisterPage: React.FC = () => {
+  const { signUp } = useAuth();
+  const navigate = useNavigate();
+
+  const [formData, setFormData] = useState({
+    username: '',
+    fullName: '',
+    password: '',
+    confirmPassword: '',
+  });
+  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [agreed, setAgreed] = useState(false);
+
+  const handleChange = (field: string, value: string) => {
+    setFormData(prev => ({ ...prev, [field]: value }));
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!formData.username || !formData.fullName || !formData.password || !formData.confirmPassword) {
+      toast.error('请填写所有必填项');
+      return;
+    }
+    if (formData.password !== formData.confirmPassword) {
+      toast.error('两次输入的密码不一致');
+      return;
+    }
+    if (formData.password.length < 6) {
+      toast.error('密码长度至少6位');
+      return;
+    }
+    if (!agreed) {
+      toast.error('请阅读并同意用户协议和隐私政策');
+      return;
+    }
+    setLoading(true);
+    const { error } = await signUp(formData.username.trim(), formData.password, formData.fullName.trim());
+    setLoading(false);
+    if (error) {
+      toast.error(error);
+    } else {
+      toast.success('注册成功，请登录');
+      navigate('/login');
+    }
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-background px-4 py-8">
+      <div className="w-full max-w-sm">
+        {/* Logo */}
+        <div className="flex flex-col items-center mb-8">
+          <div className="w-12 h-12 rounded bg-primary flex items-center justify-center mb-3">
+            <Briefcase size={24} className="text-primary-foreground" />
+          </div>
+          <h1 className="text-xl font-semibold text-foreground">创建账号</h1>
+          <p className="text-sm text-muted-foreground mt-1">加入客户拜访管理系统</p>
+        </div>
+
+        <Card className="border border-border shadow-none">
+          <form onSubmit={handleSubmit}>
+            <CardContent className="pt-6 pb-4 space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="username" className="text-sm font-normal">
+                  用户名 <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="username"
+                  type="text"
+                  placeholder="字母、数字或下划线"
+                  value={formData.username}
+                  onChange={e => handleChange('username', e.target.value)}
+                  disabled={loading}
+                  className="px-3"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="fullName" className="text-sm font-normal">
+                  姓名 <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="fullName"
+                  type="text"
+                  placeholder="您的真实姓名"
+                  value={formData.fullName}
+                  onChange={e => handleChange('fullName', e.target.value)}
+                  disabled={loading}
+                  className="px-3"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="password" className="text-sm font-normal">
+                  密码 <span className="text-destructive">*</span>
+                </Label>
+                <div className="relative">
+                  <Input
+                    id="password"
+                    type={showPassword ? 'text' : 'password'}
+                    placeholder="至少6位"
+                    value={formData.password}
+                    onChange={e => handleChange('password', e.target.value)}
+                    disabled={loading}
+                    className="px-3 pr-10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    tabIndex={-1}
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="confirmPassword" className="text-sm font-normal">
+                  确认密码 <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="confirmPassword"
+                  type={showPassword ? 'text' : 'password'}
+                  placeholder="再次输入密码"
+                  value={formData.confirmPassword}
+                  onChange={e => handleChange('confirmPassword', e.target.value)}
+                  disabled={loading}
+                  className="px-3"
+                />
+              </div>
+
+              {/* 用户协议 */}
+              <div className="flex items-start gap-2 min-h-12">
+                <input
+                  type="checkbox"
+                  id="agreement"
+                  checked={agreed}
+                  onChange={e => setAgreed(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 accent-primary cursor-pointer"
+                />
+                <label htmlFor="agreement" className="text-xs text-muted-foreground leading-relaxed cursor-pointer">
+                  我已阅读并同意
+                  <span className="text-primary underline cursor-pointer mx-0.5">用户协议</span>
+                  和
+                  <span className="text-primary underline cursor-pointer mx-0.5">隐私政策</span>
+                </label>
+              </div>
+            </CardContent>
+
+            <CardFooter className="flex-col gap-3 pt-0 pb-6 px-6">
+              <Button type="submit" className="w-full" disabled={loading}>
+                {loading && <Loader2 size={16} className="mr-2 animate-spin" />}
+                注册
+              </Button>
+              <p className="text-xs text-muted-foreground text-center">
+                已有账号？
+                <Link to="/login" className="text-primary hover:underline ml-1">
+                  立即登录
+                </Link>
+              </p>
+            </CardFooter>
+          </form>
+        </Card>
+      </div>
+    </div>
+  );
+};
+
+export default RegisterPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/RegisterPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/HomePage.tsx]
+Thought: Now create the Home Dashboard page:
+Command: create
+Created File with Text:
+```
+import React, { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  ClipboardList,
+  Mic,
+  FileSearch,
+  TrendingUp,
+  Users,
+  Calendar,
+  ArrowRight,
+  CheckCircle2,
+  Clock,
+  BarChart3,
+} from 'lucide-react';
+import { supabase } from '@/db/supabase';
+import type { VisitListItem, VisitStats } from '@/types/types';
+import { cn } from '@/lib/utils';
+import { format } from 'date-fns';
+import { zhCN } from 'date-fns/locale';
+
+const STATUS_LABEL: Record<string, { label: string; color: string }> = {
+  preparing: { label: '准备中', color: 'text-warning' },
+  recording: { label: '记录中', color: 'text-primary' },
+  processing: { label: '处理中', color: 'text-info' },
+  completed: { label: '已完成', color: 'text-success' },
+};
+
+const featureCards = [
+  {
+    path: '/visits/prepare',
+    icon: <ClipboardList size={28} className="text-primary" />,
+    title: '拜访前准备',
+    desc: '搜集客户背景资料，AI生成专业PPT',
+    action: '开始准备',
+    bg: 'bg-primary/5',
+  },
+  {
+    path: '/visits/record',
+    icon: <Mic size={28} className="text-destructive" />,
+    title: '拜访中记录',
+    desc: '录音采集拜访内容，智能转写文字',
+    action: '开始录音',
+    bg: 'bg-destructive/5',
+  },
+  {
+    path: '/visits/reports',
+    icon: <FileSearch size={28} className="text-chart-2" />,
+    title: '拜访后查询',
+    desc: 'AI整理形成结构化报告，快速检索',
+    action: '查看报告',
+    bg: 'bg-chart-2/5',
+  },
+];
+
+const HomePage: React.FC = () => {
+  const { profile } = useAuth();
+  const [stats, setStats] = useState<VisitStats | null>(null);
+  const [recentVisits, setRecentVisits] = useState<VisitListItem[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      setLoading(true);
+      try {
+        // 获取统计数据
+        let statsQuery = supabase.from('visits').select('id, customer_name, status, visit_time, created_at');
+        if (profile?.role !== 'admin') {
+          statsQuery = statsQuery.eq('user_id', profile?.id || '');
+        }
+        const { data: allVisits } = await statsQuery;
+
+        if (allVisits) {
+          const now = new Date();
+          const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+          const uniqueCustomers = new Set(allVisits.map(v => v.customer_name));
+
+          setStats({
+            totalVisits: allVisits.length,
+            completedVisits: allVisits.filter(v => v.status === 'completed').length,
+            thisMonthVisits: allVisits.filter(v => new Date(v.created_at) >= thisMonthStart).length,
+            totalCustomers: uniqueCustomers.size,
+          });
+        }
+
+        // 获取最近拜访记录
+        let recentQuery = supabase
+          .from('visits')
+          .select('id, user_id, customer_name, customer_industry, visit_time, status, keywords, transcript, structured_report, created_at')
+          .order('created_at', { ascending: false })
+          .limit(5);
+        if (profile?.role !== 'admin') {
+          recentQuery = recentQuery.eq('user_id', profile?.id || '');
+        }
+        const { data: visits } = await recentQuery;
+        if (visits) setRecentVisits(visits as VisitListItem[]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    if (profile) fetchData();
+  }, [profile]);
+
+  return (
+    <MainLayout>
+      <div className="space-y-6">
+        {/* 欢迎头部 */}
+        <div>
+          <h1 className="text-lg font-semibold text-foreground">
+            你好，{profile?.full_name || profile?.username} 👋
+          </h1>
+          <p className="text-sm text-muted-foreground mt-0.5">
+            {format(new Date(), 'yyyy年M月d日 EEEE', { locale: zhCN })}
+          </p>
+        </div>
+
+        {/* 统计卡片 */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {[
+            { icon: <BarChart3 size={18} className="text-primary" />, label: '总拜访次数', value: stats?.totalVisits ?? 0 },
+            { icon: <CheckCircle2 size={18} className="text-chart-2" />, label: '已完成报告', value: stats?.completedVisits ?? 0 },
+            { icon: <Calendar size={18} className="text-chart-3" />, label: '本月拜访', value: stats?.thisMonthVisits ?? 0 },
+            { icon: <Users size={18} className="text-chart-4" />, label: '累计客户数', value: stats?.totalCustomers ?? 0 },
+          ].map((item, idx) => (
+            <Card key={idx} className="border border-border shadow-none h-full">
+              <CardContent className="p-4 flex flex-col justify-between h-full">
+                <div className="flex items-center gap-2 mb-2">
+                  {item.icon}
+                  <span className="text-xs text-muted-foreground">{item.label}</span>
+                </div>
+                {loading ? (
+                  <Skeleton className="h-7 w-12 bg-muted" />
+                ) : (
+                  <div className="text-2xl font-semibold text-foreground">{item.value}</div>
+                )}
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+
+        {/* 功能入口 */}
+        <div>
+          <h2 className="text-sm font-medium text-muted-foreground mb-3 uppercase tracking-wide">核心功能</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {featureCards.map(card => (
+              <Card key={card.path} className="border border-border shadow-none h-full hover:border-primary/30 transition-colors">
+                <CardContent className="p-5 flex flex-col h-full">
+                  <div className={cn('w-12 h-12 rounded flex items-center justify-center mb-4', card.bg)}>
+                    {card.icon}
+                  </div>
+                  <h3 className="font-semibold text-foreground mb-1 text-balance">{card.title}</h3>
+                  <p className="text-sm text-muted-foreground mb-4 flex-1 text-pretty">{card.desc}</p>
+                  <Link to={card.path}>
+                    <Button variant="outline" size="sm" className="w-full justify-between">
+                      {card.action}
+                      <ArrowRight size={14} />
+                    </Button>
+                  </Link>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </div>
+
+        {/* 最近拜访记录 */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wide">最近拜访</h2>
+            <Link to="/visits/reports" className="text-xs text-primary hover:underline flex items-center gap-1">
+              查看全部 <ArrowRight size={12} />
+            </Link>
+          </div>
+          <Card className="border border-border shadow-none">
+            {loading ? (
+              <CardContent className="p-4 space-y-3">
+                {[1, 2, 3].map(i => <Skeleton key={i} className="h-12 w-full bg-muted" />)}
+              </CardContent>
+            ) : recentVisits.length === 0 ? (
+              <CardContent className="p-8 text-center">
+                <TrendingUp size={32} className="mx-auto text-muted-foreground/30 mb-2" />
+                <p className="text-sm text-muted-foreground">暂无拜访记录，开始第一次拜访吧</p>
+                <Link to="/visits/prepare">
+                  <Button size="sm" className="mt-3">新建拜访</Button>
+                </Link>
+              </CardContent>
+            ) : (
+              <div className="divide-y divide-border">
+                {recentVisits.map(visit => {
+                  const statusInfo = STATUS_LABEL[visit.status] || STATUS_LABEL.preparing;
+                  return (
+                    <Link
+                      key={visit.id}
+                      to={`/visits/reports/${visit.id}`}
+                      className="flex items-center justify-between px-4 py-3 hover:bg-muted/40 transition-colors"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="font-medium text-sm text-foreground truncate">{visit.customer_name}</span>
+                          {visit.customer_industry && (
+                            <Badge variant="secondary" className="text-xs shrink-0">{visit.customer_industry}</Badge>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1 mt-0.5">
+                          <Clock size={11} className="text-muted-foreground" />
+                          <span className="text-xs text-muted-foreground">
+                            {visit.visit_time
+                              ? format(new Date(visit.visit_time), 'M月d日 HH:mm', { locale: zhCN })
+                              : format(new Date(visit.created_at), 'M月d日 HH:mm', { locale: zhCN })}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className={cn('text-xs font-medium', statusInfo.color)}>{statusInfo.label}</span>
+                        <ArrowRight size={14} className="text-muted-foreground" />
+                      </div>
+                    </Link>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
+        </div>
+      </div>
+    </MainLayout>
+  );
+};
+
+export default HomePage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/HomePage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/VisitPreparePage.tsx]
+Thought: Now create the Visit Preparation page:
+Command: create
+Created File with Text:
+```
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Separator } from '@/components/ui/separator';
+import {
+  ClipboardList, Sparkles, Download, ChevronRight, Loader2,
+  FilePresentation, RefreshCw, CheckCircle2, Info,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { supabase } from '@/db/supabase';
+import type { PptContent, CustomerBackground } from '@/types/types';
+
+// 行业选项
+const INDUSTRY_OPTIONS = [
+  '制造业', '金融/银行', '医疗/医药', '教育/培训', '零售/电商',
+  '互联网/科技', '房地产/建设', '能源/化工', '交通/物流', '政府/公共服务', '其他',
+];
+
+// 公司规模选项
+const SIZE_OPTIONS = ['初创企业(1-50人)', '中小企业(50-500人)', '大型企业(500-5000人)', '集团企业(5000人以上)'];
+
+type Step = 'form' | 'background' | 'ppt';
+
+const VisitPreparePage: React.FC = () => {
+  const { profile } = useAuth();
+  const navigate = useNavigate();
+  const [step, setStep] = useState<Step>('form');
+
+  const [formData, setFormData] = useState({
+    customerName: '',
+    industry: '',
+    companySize: '',
+    contact: '',
+    background: '',
+    purpose: '',
+  });
+
+  const [loadingBackground, setLoadingBackground] = useState(false);
+  const [loadingPpt, setLoadingPpt] = useState(false);
+  const [backgroundData, setBackgroundData] = useState<CustomerBackground | null>(null);
+  const [pptData, setPptData] = useState<PptContent | null>(null);
+  const [savedVisitId, setSavedVisitId] = useState<string | null>(null);
+
+  const handleChange = (field: string, value: string) => {
+    setFormData(prev => ({ ...prev, [field]: value }));
+  };
+
+  // 生成客户背景调研
+  const handleGenerateBackground = async () => {
+    if (!formData.customerName.trim()) {
+      toast.error('请填写客户名称');
+      return;
+    }
+    setLoadingBackground(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('generate-text', {
+        body: { type: 'background', data: formData },
+      });
+      if (error) {
+        const msg = await error?.context?.text();
+        throw new Error(msg || error.message);
+      }
+      if (data?.success && data.data) {
+        setBackgroundData(data.data as CustomerBackground);
+        setStep('background');
+        toast.success('背景调研完成');
+      } else {
+        throw new Error('背景调研生成失败');
+      }
+    } catch (err: unknown) {
+      toast.error(`背景调研失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setLoadingBackground(false);
+    }
+  };
+
+  // 生成PPT
+  const handleGeneratePpt = async () => {
+    setLoadingPpt(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('generate-text', {
+        body: { type: 'ppt', data: formData },
+      });
+      if (error) {
+        const msg = await error?.context?.text();
+        throw new Error(msg || error.message);
+      }
+      if (data?.success && data.data) {
+        setPptData(data.data as PptContent);
+        setStep('ppt');
+        toast.success('PPT生成完成');
+
+        // 保存到数据库
+        const visitPayload = {
+          user_id: profile!.id,
+          customer_name: formData.customerName,
+          customer_industry: formData.industry || null,
+          customer_contact: formData.contact || null,
+          customer_size: formData.companySize || null,
+          customer_background: formData.background || null,
+          visit_purpose: formData.purpose || null,
+          ppt_content: data.data,
+          status: 'preparing' as const,
+        };
+
+        if (savedVisitId) {
+          await supabase.from('visits').update(visitPayload).eq('id', savedVisitId);
+        } else {
+          const { data: visitData } = await supabase
+            .from('visits')
+            .insert(visitPayload)
+            .select('id')
+            .maybeSingle();
+          if (visitData?.id) setSavedVisitId(visitData.id);
+        }
+      } else {
+        throw new Error('PPT生成失败');
+      }
+    } catch (err: unknown) {
+      toast.error(`PPT生成失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setLoadingPpt(false);
+    }
+  };
+
+  // 下载PPT（HTML格式）
+  const handleDownloadPpt = () => {
+    if (!pptData) return;
+    const html = generatePptHtml(pptData);
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${formData.customerName}-拜访PPT.html`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success('PPT下载成功');
+  };
+
+  return (
+    <MainLayout>
+      <div className="max-w-4xl mx-auto space-y-6">
+        {/* 标题 */}
+        <div className="flex items-center gap-2">
+          <ClipboardList size={20} className="text-primary" />
+          <h1 className="text-lg font-semibold">拜访前准备</h1>
+        </div>
+
+        {/* 步骤指示器 */}
+        <div className="flex items-center gap-2 text-sm">
+          {['form', 'background', 'ppt'].map((s, idx) => (
+            <React.Fragment key={s}>
+              {idx > 0 && <ChevronRight size={14} className="text-muted-foreground shrink-0" />}
+              <span className={step === s || (idx === 0 && step !== 'form') || (idx === 1 && step === 'ppt')
+                ? 'text-primary font-medium'
+                : 'text-muted-foreground'}>
+                {s === 'form' ? '①填写客户信息' : s === 'background' ? '②背景调研' : '③生成PPT'}
+              </span>
+            </React.Fragment>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+          {/* 左侧：客户信息表单 */}
+          <div className="lg:col-span-2 space-y-4">
+            <Card className="border border-border shadow-none">
+              <CardHeader className="pb-3 pt-4 px-5">
+                <CardTitle className="text-sm font-medium text-foreground flex items-center gap-2">
+                  <Info size={14} className="text-primary" />
+                  客户基本信息
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="px-5 pb-5 space-y-4">
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">客户名称 <span className="text-destructive">*</span></Label>
+                  <Input
+                    placeholder="公司名称"
+                    value={formData.customerName}
+                    onChange={e => handleChange('customerName', e.target.value)}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">所属行业</Label>
+                  <Select value={formData.industry} onValueChange={v => handleChange('industry', v)}>
+                    <SelectTrigger className="px-3">
+                      <SelectValue placeholder="选择行业" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {INDUSTRY_OPTIONS.map(opt => (
+                        <SelectItem key={opt} value={opt}>{opt}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">公司规模</Label>
+                  <Select value={formData.companySize} onValueChange={v => handleChange('companySize', v)}>
+                    <SelectTrigger className="px-3">
+                      <SelectValue placeholder="选择规模" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {SIZE_OPTIONS.map(opt => (
+                        <SelectItem key={opt} value={opt}>{opt}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">联系方式</Label>
+                  <Input
+                    placeholder="电话/邮箱"
+                    value={formData.contact}
+                    onChange={e => handleChange('contact', e.target.value)}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">拜访目的</Label>
+                  <Input
+                    placeholder="例：产品演示、合同续签"
+                    value={formData.purpose}
+                    onChange={e => handleChange('purpose', e.target.value)}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">已知背景信息</Label>
+                  <Textarea
+                    placeholder="已掌握的客户信息（可选）"
+                    value={formData.background}
+                    onChange={e => handleChange('background', e.target.value)}
+                    className="px-3 min-h-[80px] resize-none"
+                    rows={3}
+                  />
+                </div>
+
+                <div className="space-y-2 pt-1">
+                  <Button
+                    className="w-full"
+                    onClick={handleGenerateBackground}
+                    disabled={loadingBackground || !formData.customerName.trim()}
+                  >
+                    {loadingBackground
+                      ? <><Loader2 size={14} className="mr-2 animate-spin" />分析中...</>
+                      : <><Sparkles size={14} className="mr-2" />AI背景调研</>}
+                  </Button>
+                  {step !== 'form' && (
+                    <Button
+                      variant="outline"
+                      className="w-full"
+                      onClick={handleGeneratePpt}
+                      disabled={loadingPpt}
+                    >
+                      {loadingPpt
+                        ? <><Loader2 size={14} className="mr-2 animate-spin" />生成中...</>
+                        : <><FilePresentation size={14} className="mr-2" />生成PPT</>}
+                    </Button>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* 右侧：结果展示 */}
+          <div className="lg:col-span-3 space-y-4">
+            {/* 背景调研结果 */}
+            {(step === 'background' || step === 'ppt') && (
+              <Card className="border border-border shadow-none">
+                <CardHeader className="pb-3 pt-4 px-5 flex flex-row items-center justify-between">
+                  <CardTitle className="text-sm font-medium flex items-center gap-2">
+                    <CheckCircle2 size={14} className="text-chart-2" />
+                    背景调研报告
+                  </CardTitle>
+                  <Button variant="ghost" size="sm" onClick={handleGenerateBackground} disabled={loadingBackground}
+                    className="text-xs text-muted-foreground hover:text-foreground h-7 px-2">
+                    <RefreshCw size={12} className="mr-1" />重新生成
+                  </Button>
+                </CardHeader>
+                {loadingBackground ? (
+                  <CardContent className="px-5 pb-5 space-y-3">
+                    {[1, 2, 3].map(i => <Skeleton key={i} className="h-8 w-full bg-muted" />)}
+                  </CardContent>
+                ) : backgroundData && (
+                  <CardContent className="px-5 pb-5 space-y-4 text-sm">
+                    <BackgroundSection title="公司简介" content={backgroundData.companyProfile} />
+                    <Separator />
+                    <BackgroundSection title="行业分析" content={backgroundData.industryAnalysis} />
+                    <Separator />
+                    <BackgroundSection title="市场定位" content={backgroundData.marketPosition} />
+                    <Separator />
+                    <TagsSection title="潜在需求" items={backgroundData.potentialNeeds} color="bg-primary/10 text-primary" />
+                    <Separator />
+                    <TagsSection title="拜访策略" items={backgroundData.visitStrategy} color="bg-chart-2/10 text-chart-2" />
+                    <Separator />
+                    <TagsSection title="话题建议" items={backgroundData.talkingPoints} color="bg-chart-3/10 text-chart-3" />
+                    {backgroundData.riskPoints?.length > 0 && (
+                      <>
+                        <Separator />
+                        <TagsSection title="注意事项" items={backgroundData.riskPoints} color="bg-destructive/10 text-destructive" />
+                      </>
+                    )}
+                  </CardContent>
+                )}
+              </Card>
+            )}
+
+            {/* PPT预览 */}
+            {step === 'ppt' && (
+              <Card className="border border-border shadow-none">
+                <CardHeader className="pb-3 pt-4 px-5 flex flex-row items-center justify-between">
+                  <CardTitle className="text-sm font-medium flex items-center gap-2">
+                    <FilePresentation size={14} className="text-primary" />
+                    PPT内容预览
+                  </CardTitle>
+                  <div className="flex items-center gap-2">
+                    <Button variant="ghost" size="sm" onClick={handleGeneratePpt} disabled={loadingPpt}
+                      className="text-xs text-muted-foreground hover:text-foreground h-7 px-2">
+                      <RefreshCw size={12} className="mr-1" />重新生成
+                    </Button>
+                    <Button size="sm" onClick={handleDownloadPpt} className="h-7 px-3 text-xs">
+                      <Download size={12} className="mr-1" />下载PPT
+                    </Button>
+                  </div>
+                </CardHeader>
+                {loadingPpt ? (
+                  <CardContent className="px-5 pb-5 space-y-3">
+                    {[1, 2, 3, 4].map(i => <Skeleton key={i} className="h-16 w-full bg-muted" />)}
+                  </CardContent>
+                ) : pptData && (
+                  <CardContent className="px-5 pb-5 space-y-3">
+                    {/* 封面 */}
+                    <div className="bg-primary rounded p-5 text-primary-foreground text-center">
+                      <div className="text-base font-semibold text-balance">{pptData.title}</div>
+                      <div className="text-sm mt-1 opacity-80">{pptData.subtitle}</div>
+                    </div>
+                    {/* 幻灯片 */}
+                    {pptData.slides?.map((slide, idx) => (
+                      <div key={idx} className="border border-border rounded p-4">
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded font-medium">
+                            第{idx + 1}页
+                          </span>
+                          <span className="text-sm font-medium text-foreground text-balance">{slide.title}</span>
+                        </div>
+                        <ul className="space-y-1">
+                          {slide.content?.map((point, pIdx) => (
+                            <li key={pIdx} className="flex items-start gap-2 text-sm text-muted-foreground">
+                              <span className="text-primary mt-0.5 shrink-0">•</span>
+                              <span className="text-pretty">{point}</span>
+                            </li>
+                          ))}
+                        </ul>
+                        {slide.notes && (
+                          <div className="mt-2 text-xs text-muted-foreground/60 italic border-t border-border pt-2">
+                            备注: {slide.notes}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <div className="pt-2">
+                      <Button className="w-full" onClick={() => navigate('/visits/record')}>
+                        前往录音记录 <ChevronRight size={14} className="ml-1" />
+                      </Button>
+                    </div>
+                  </CardContent>
+                )}
+              </Card>
+            )}
+
+            {/* 空状态提示 */}
+            {step === 'form' && (
+              <div className="flex flex-col items-center justify-center text-center h-64 rounded border border-dashed border-border">
+                <Sparkles size={32} className="text-muted-foreground/30 mb-3" />
+                <p className="text-sm text-muted-foreground">填写客户信息后，点击「AI背景调研」</p>
+                <p className="text-xs text-muted-foreground/60 mt-1">AI将自动分析客户背景并生成专业PPT</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </MainLayout>
+  );
+};
+
+// 辅助组件
+function BackgroundSection({ title, content }: { title: string; content: string }) {
+  return (
+    <div>
+      <div className="text-xs font-medium text-muted-foreground mb-1">{title}</div>
+      <p className="text-sm text-foreground text-pretty leading-relaxed">{content}</p>
+    </div>
+  );
+}
+
+function TagsSection({ title, items, color }: { title: string; items: string[]; color: string }) {
+  return (
+    <div>
+      <div className="text-xs font-medium text-muted-foreground mb-2">{title}</div>
+      <div className="flex flex-wrap gap-1.5">
+        {items?.map((item, idx) => (
+          <span key={idx} className={`text-xs px-2 py-0.5 rounded ${color}`}>{item}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// 生成PPT HTML文件
+function generatePptHtml(ppt: PptContent): string {
+  const slidesHtml = ppt.slides?.map((slide, idx) => `
+    <div class="slide">
+      <div class="slide-number">${idx + 1} / ${ppt.slides.length}</div>
+      <h2>${slide.title}</h2>
+      <ul>${slide.content?.map(p => `<li>${p}</li>`).join('')}</ul>
+      ${slide.notes ? `<div class="notes">备注: ${slide.notes}</div>` : ''}
+    </div>
+  `).join('') || '';
+
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>${ppt.title}</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f7fa; padding: 20px; }
+    h1 { text-align: center; color: #1d4ed8; margin-bottom: 8px; }
+    .subtitle { text-align: center; color: #6b7280; margin-bottom: 32px; }
+    .slide { background: white; border: 1px solid #e5e7eb; border-radius: 4px; padding: 32px; margin-bottom: 16px; position: relative; }
+    .slide-number { position: absolute; top: 12px; right: 16px; font-size: 12px; color: #9ca3af; }
+    .slide h2 { color: #1d4ed8; font-size: 18px; margin-bottom: 16px; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
+    .slide ul { padding-left: 20px; }
+    .slide li { color: #374151; margin-bottom: 8px; line-height: 1.6; }
+    .notes { margin-top: 16px; font-size: 12px; color: #9ca3af; border-top: 1px solid #f3f4f6; padding-top: 12px; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>${ppt.title}</h1>
+  <div class="subtitle">${ppt.subtitle}</div>
+  ${slidesHtml}
+</body>
+</html>`;
+}
+
+export default VisitPreparePage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/VisitPreparePage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/VisitRecordPage.tsx]
+Thought: Now create the Visit Recording page:
+Command: create
+Created File with Text:
+```
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import { Badge } from '@/components/ui/badge';
+import { Progress } from '@/components/ui/progress';
+import { Separator } from '@/components/ui/separator';
+import {
+  Mic, MicOff, Square, Play, Pause, Upload, CheckCircle2,
+  Clock, Loader2, FileAudio, X, Save, AlertCircle,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { supabase } from '@/db/supabase';
+import { format } from 'date-fns';
+import { cn } from '@/lib/utils';
+
+type RecordingState = 'idle' | 'recording' | 'paused' | 'stopped';
+
+function formatDuration(seconds: number): string {
+  const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+  const s = (seconds % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+const VisitRecordPage: React.FC = () => {
+  const { profile } = useAuth();
+
+  // 录音状态
+  const [recordingState, setRecordingState] = useState<RecordingState>('idle');
+  const [duration, setDuration] = useState(0);
+  const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+
+  // 上传状态
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState(false);
+  const [recordingStoragePath, setRecordingStoragePath] = useState<string | null>(null);
+
+  // 拜访信息
+  const [visitForm, setVisitForm] = useState({
+    customerName: '',
+    visitTime: format(new Date(), "yyyy-MM-dd'T'HH:mm"),
+    visitLocation: '',
+    visitPurpose: '',
+    notes: '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [savedVisitId, setSavedVisitId] = useState<string | null>(null);
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+    };
+  }, [audioUrl]);
+
+  // 开始录音
+  const startRecording = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg';
+      const recorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = recorder;
+      chunksRef.current = [];
+
+      recorder.ondataavailable = e => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: mimeType });
+        setAudioBlob(blob);
+        const url = URL.createObjectURL(blob);
+        setAudioUrl(url);
+        stream.getTracks().forEach(t => t.stop());
+        setRecordingState('stopped');
+      };
+
+      recorder.start(1000);
+      setRecordingState('recording');
+      setDuration(0);
+
+      timerRef.current = setInterval(() => {
+        setDuration(prev => prev + 1);
+      }, 1000);
+    } catch {
+      toast.error('无法访问麦克风，请检查浏览器权限');
+    }
+  }, []);
+
+  // 暂停录音
+  const pauseRecording = useCallback(() => {
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.pause();
+      setRecordingState('paused');
+      if (timerRef.current) clearInterval(timerRef.current);
+    }
+  }, []);
+
+  // 继续录音
+  const resumeRecording = useCallback(() => {
+    if (mediaRecorderRef.current?.state === 'paused') {
+      mediaRecorderRef.current.resume();
+      setRecordingState('recording');
+      timerRef.current = setInterval(() => {
+        setDuration(prev => prev + 1);
+      }, 1000);
+    }
+  }, []);
+
+  // 停止录音
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      if (timerRef.current) clearInterval(timerRef.current);
+    }
+  }, []);
+
+  // 重新录音
+  const resetRecording = useCallback(() => {
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    setAudioBlob(null);
+    setAudioUrl(null);
+    setDuration(0);
+    setRecordingState('idle');
+    setUploaded(false);
+    setRecordingStoragePath(null);
+  }, [audioUrl]);
+
+  // 处理文件选择
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const allowedTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm', 'audio/mp4', 'audio/aac'];
+    if (!allowedTypes.includes(file.type) && !file.name.match(/\.(mp3|wav|ogg|webm|m4a|aac|flac)$/i)) {
+      toast.error('不支持的音频格式，请上传 MP3/WAV/OGG/WebM/AAC 格式文件');
+      return;
+    }
+
+    setUploadFile(file);
+    const url = URL.createObjectURL(file);
+    setAudioUrl(url);
+    setUploaded(false);
+  };
+
+  // 上传录音到Supabase Storage
+  const uploadRecording = async (blobOrFile: Blob | File): Promise<string | null> => {
+    if (!profile) return null;
+
+    const ext = blobOrFile instanceof File
+      ? blobOrFile.name.split('.').pop() || 'webm'
+      : 'webm';
+    const fileName = `${profile.id}/${Date.now()}_recording.${ext}`;
+
+    setUploading(true);
+    setUploadProgress(0);
+
+    // 模拟进度（Supabase Storage不支持上传进度回调）
+    const progressInterval = setInterval(() => {
+      setUploadProgress(prev => Math.min(prev + 10, 90));
+    }, 200);
+
+    try {
+      const { error } = await supabase.storage
+        .from('recordings')
+        .upload(fileName, blobOrFile, {
+          contentType: blobOrFile instanceof File ? blobOrFile.type : 'audio/webm',
+        });
+
+      clearInterval(progressInterval);
+
+      if (error) throw error;
+
+      setUploadProgress(100);
+      setUploaded(true);
+      setRecordingStoragePath(fileName);
+      toast.success('录音上传成功');
+      return fileName;
+    } catch (err: unknown) {
+      clearInterval(progressInterval);
+      toast.error(`上传失败：${err instanceof Error ? err.message : '未知错误'}`);
+      return null;
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // 提交上传
+  const handleUploadSubmit = async () => {
+    const target = uploadFile || audioBlob;
+    if (!target) {
+      toast.error('请先录制或选择音频文件');
+      return;
+    }
+    await uploadRecording(target);
+  };
+
+  // 保存拜访记录
+  const handleSaveVisit = async () => {
+    if (!visitForm.customerName.trim()) {
+      toast.error('请填写客户名称');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const fileName = uploadFile?.name || `录音_${format(new Date(), 'yyyyMMdd_HHmm')}.webm`;
+      const payload = {
+        user_id: profile!.id,
+        customer_name: visitForm.customerName,
+        visit_time: visitForm.visitTime ? new Date(visitForm.visitTime).toISOString() : null,
+        visit_location: visitForm.visitLocation || null,
+        visit_purpose: visitForm.visitPurpose || null,
+        notes: visitForm.notes || null,
+        recording_url: recordingStoragePath || null,
+        recording_name: recordingStoragePath ? fileName : null,
+        recording_duration: duration > 0 ? duration : null,
+        status: recordingStoragePath ? 'recording' as const : 'preparing' as const,
+      };
+
+      let visitId = savedVisitId;
+      if (savedVisitId) {
+        await supabase.from('visits').update(payload).eq('id', savedVisitId);
+      } else {
+        const { data } = await supabase.from('visits').insert(payload).select('id').maybeSingle();
+        visitId = data?.id || null;
+        if (visitId) setSavedVisitId(visitId);
+      }
+
+      toast.success('拜访记录保存成功');
+    } catch (err: unknown) {
+      toast.error(`保存失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <MainLayout>
+      <div className="max-w-4xl mx-auto space-y-6">
+        {/* 标题 */}
+        <div className="flex items-center gap-2">
+          <Mic size={20} className="text-destructive" />
+          <h1 className="text-lg font-semibold">拜访中记录</h1>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* 左：录音区域 */}
+          <div className="space-y-4">
+            {/* 录音控制 */}
+            <Card className="border border-border shadow-none">
+              <CardHeader className="pb-3 pt-4 px-5">
+                <CardTitle className="text-sm font-medium flex items-center gap-2">
+                  <Mic size={14} className="text-destructive" />
+                  实时录音
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="px-5 pb-5">
+                {/* 录音状态展示区 */}
+                <div className="flex flex-col items-center py-6">
+                  {/* 麦克风图标 */}
+                  <div className={cn(
+                    'w-20 h-20 rounded-full flex items-center justify-center mb-4 transition-all duration-300',
+                    recordingState === 'recording' ? 'bg-destructive/10 ring-4 ring-destructive/20' : 'bg-muted'
+                  )}>
+                    {recordingState === 'recording' ? (
+                      <Mic size={32} className="text-destructive" />
+                    ) : recordingState === 'stopped' ? (
+                      <CheckCircle2 size={32} className="text-chart-2" />
+                    ) : (
+                      <MicOff size={32} className="text-muted-foreground" />
+                    )}
+                  </div>
+
+                  {/* 波形动画 */}
+                  {recordingState === 'recording' && (
+                    <div className="flex items-end gap-1 mb-4 h-8">
+                      {[14, 22, 18, 28, 20, 26, 16, 24, 18, 22].map((h, i) => (
+                        <span key={i} className="wave-bar" style={{ height: `${h}px`, animationDelay: `${i * 0.08}s` }} />
+                      ))}
+                    </div>
+                  )}
+
+                  {/* 录音时长 */}
+                  <div className="flex items-center gap-2 mb-4">
+                    <Clock size={14} className="text-muted-foreground" />
+                    <span className={cn(
+                      'text-2xl font-mono font-medium',
+                      recordingState === 'recording' ? 'text-destructive' : 'text-foreground'
+                    )}>
+                      {formatDuration(duration)}
+                    </span>
+                    {recordingState === 'recording' && (
+                      <span className="flex h-2 w-2">
+                        <span className="animate-ping absolute h-2 w-2 rounded-full bg-destructive opacity-75" />
+                        <span className="rounded-full h-2 w-2 bg-destructive" />
+                      </span>
+                    )}
+                  </div>
+
+                  {/* 状态文字 */}
+                  <div className="text-sm text-muted-foreground mb-6">
+                    {recordingState === 'idle' && '准备录音'}
+                    {recordingState === 'recording' && '录音中...'}
+                    {recordingState === 'paused' && '已暂停'}
+                    {recordingState === 'stopped' && `录音完成 · ${formatDuration(duration)}`}
+                  </div>
+
+                  {/* 控制按钮 */}
+                  <div className="flex items-center gap-3">
+                    {recordingState === 'idle' && (
+                      <Button onClick={startRecording} className="px-6">
+                        <Mic size={16} className="mr-2" />开始录音
+                      </Button>
+                    )}
+                    {recordingState === 'recording' && (
+                      <>
+                        <Button variant="outline" onClick={pauseRecording}>
+                          <Pause size={16} className="mr-2" />暂停
+                        </Button>
+                        <Button variant="destructive" onClick={stopRecording}>
+                          <Square size={16} className="mr-2" />结束
+                        </Button>
+                      </>
+                    )}
+                    {recordingState === 'paused' && (
+                      <>
+                        <Button onClick={resumeRecording}>
+                          <Play size={16} className="mr-2" />继续
+                        </Button>
+                        <Button variant="destructive" onClick={stopRecording}>
+                          <Square size={16} className="mr-2" />结束
+                        </Button>
+                      </>
+                    )}
+                    {recordingState === 'stopped' && (
+                      <Button variant="ghost" size="sm" onClick={resetRecording} className="text-muted-foreground">
+                        <X size={14} className="mr-1" />重新录音
+                      </Button>
+                    )}
+                  </div>
+                </div>
+
+                {/* 录音预览 */}
+                {audioUrl && recordingState === 'stopped' && (
+                  <div className="border border-border rounded p-3 bg-muted/20">
+                    <audio controls src={audioUrl} className="w-full" style={{ height: '36px' }} />
+                  </div>
+                )}
+
+                {duration < 5 && recordingState === 'stopped' && (
+                  <div className="flex items-center gap-2 mt-3 text-xs text-warning">
+                    <AlertCircle size={12} />
+                    录音时长较短，建议重新录制
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* 文件上传 */}
+            <Card className="border border-border shadow-none">
+              <CardHeader className="pb-3 pt-4 px-5">
+                <CardTitle className="text-sm font-medium flex items-center gap-2">
+                  <Upload size={14} className="text-primary" />
+                  上传录音文件
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="px-5 pb-5 space-y-3">
+                <div
+                  className="border-2 border-dashed border-border rounded p-6 text-center cursor-pointer hover:border-primary/50 hover:bg-muted/20 transition-colors"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  {uploadFile ? (
+                    <div className="flex items-center gap-3 justify-center">
+                      <FileAudio size={20} className="text-primary" />
+                      <span className="text-sm text-foreground truncate max-w-[200px]">{uploadFile.name}</span>
+                    </div>
+                  ) : (
+                    <>
+                      <Upload size={24} className="mx-auto text-muted-foreground mb-2" />
+                      <p className="text-sm text-muted-foreground">点击选择录音文件</p>
+                      <p className="text-xs text-muted-foreground/60 mt-1">支持 MP3 / WAV / OGG / WebM / AAC</p>
+                    </>
+                  )}
+                </div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="audio/*"
+                  className="hidden"
+                  onChange={handleFileSelect}
+                />
+
+                {/* 上传进度 */}
+                {uploading && (
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-xs text-muted-foreground">
+                      <span>上传中...</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <Progress value={uploadProgress} className="h-1.5" />
+                  </div>
+                )}
+
+                {/* 文件预览 */}
+                {audioUrl && uploadFile && (
+                  <audio controls src={audioUrl} className="w-full" style={{ height: '36px' }} />
+                )}
+
+                {uploaded ? (
+                  <div className="flex items-center gap-2 text-sm text-chart-2">
+                    <CheckCircle2 size={14} />上传成功
+                  </div>
+                ) : (
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={handleUploadSubmit}
+                    disabled={uploading || (!uploadFile && !audioBlob) || recordingState === 'recording'}
+                  >
+                    {uploading
+                      ? <><Loader2 size={14} className="mr-2 animate-spin" />上传中...</>
+                      : <><Upload size={14} className="mr-2" />上传到云端</>}
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* 右：拜访信息填写 */}
+          <div>
+            <Card className="border border-border shadow-none">
+              <CardHeader className="pb-3 pt-4 px-5">
+                <CardTitle className="text-sm font-medium flex items-center gap-2">
+                  <Save size={14} className="text-primary" />
+                  拜访信息记录
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="px-5 pb-5 space-y-4">
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">客户名称 <span className="text-destructive">*</span></Label>
+                  <Input
+                    placeholder="公司或客户姓名"
+                    value={visitForm.customerName}
+                    onChange={e => setVisitForm(prev => ({ ...prev, customerName: e.target.value }))}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">拜访时间</Label>
+                  <Input
+                    type="datetime-local"
+                    value={visitForm.visitTime}
+                    onChange={e => setVisitForm(prev => ({ ...prev, visitTime: e.target.value }))}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">拜访地点</Label>
+                  <Input
+                    placeholder="会议室/客户办公室/线上"
+                    value={visitForm.visitLocation}
+                    onChange={e => setVisitForm(prev => ({ ...prev, visitLocation: e.target.value }))}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">拜访目的</Label>
+                  <Input
+                    placeholder="产品演示/合同谈判/需求调研"
+                    value={visitForm.visitPurpose}
+                    onChange={e => setVisitForm(prev => ({ ...prev, visitPurpose: e.target.value }))}
+                    className="px-3"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-normal">补充说明</Label>
+                  <Textarea
+                    placeholder="其他补充信息..."
+                    value={visitForm.notes}
+                    onChange={e => setVisitForm(prev => ({ ...prev, notes: e.target.value }))}
+                    className="px-3 resize-none"
+                    rows={3}
+                  />
+                </div>
+
+                <Separator />
+
+                {/* 录音状态提示 */}
+                <div className="flex items-center gap-2 text-xs">
+                  {uploaded ? (
+                    <Badge variant="secondary" className="text-chart-2 bg-chart-2/10">
+                      <CheckCircle2 size={10} className="mr-1" />录音已上传
+                    </Badge>
+                  ) : recordingState === 'stopped' ? (
+                    <Badge variant="secondary" className="text-warning bg-warning/10">
+                      <AlertCircle size={10} className="mr-1" />录音待上传
+                    </Badge>
+                  ) : recordingState === 'recording' ? (
+                    <Badge variant="secondary" className="text-destructive bg-destructive/10">
+                      <span className="animate-pulse mr-1">●</span>录音中
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-foreground">尚未录音</span>
+                  )}
+                </div>
+
+                <Button
+                  className="w-full"
+                  onClick={handleSaveVisit}
+                  disabled={saving || recordingState === 'recording'}
+                >
+                  {saving
+                    ? <><Loader2 size={14} className="mr-2 animate-spin" />保存中...</>
+                    : savedVisitId
+                      ? <><CheckCircle2 size={14} className="mr-2" />已保存（点击更新）</>
+                      : <><Save size={14} className="mr-2" />保存拜访记录</>}
+                </Button>
+
+                {savedVisitId && (
+                  <p className="text-xs text-center text-chart-2">
+                    记录已保存，可在「拜访报告」中查看和处理
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </div>
+    </MainLayout>
+  );
+};
+
+export default VisitRecordPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/VisitRecordPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/VisitReportsPage.tsx]
+Thought: Now create the Reports List page:
+Command: create
+Created File with Text:
+```
+import React, { useEffect, useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
+import { useAuth } from '@/contexts/AuthContext';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  Search, FileSearch, ArrowRight, Calendar, User,
+  SlidersHorizontal, ChevronLeft, ChevronRight, RefreshCw,
+} from 'lucide-react';
+import { supabase } from '@/db/supabase';
+import type { VisitListItem } from '@/types/types';
+import { format } from 'date-fns';
+import { zhCN } from 'date-fns/locale';
+import { cn } from '@/lib/utils';
+
+const STATUS_CONFIG = {
+  preparing: { label: '准备中', className: 'text-warning bg-warning/10' },
+  recording: { label: '已录音', className: 'text-primary bg-primary/10' },
+  processing: { label: '处理中', className: 'text-info bg-info/10' },
+  completed: { label: '已完成', className: 'text-chart-2 bg-chart-2/10' },
+};
+
+const PAGE_SIZE = 10;
+
+const VisitReportsPage: React.FC = () => {
+  const { profile } = useAuth();
+  const [visits, setVisits] = useState<VisitListItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [searchKeyword, setSearchKeyword] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
+  const [page, setPage] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+
+  // 防抖搜索
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchKeyword);
+      setPage(0);
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchKeyword]);
+
+  const fetchVisits = useCallback(async () => {
+    if (!profile) return;
+    setLoading(true);
+    try {
+      let query = supabase
+        .from('visits')
+        .select('id, user_id, customer_name, customer_industry, visit_time, status, keywords, transcript, structured_report, created_at, profiles!visits_user_id_fkey(username, full_name)', { count: 'exact' });
+
+      if (profile.role !== 'admin') {
+        query = query.eq('user_id', profile.id);
+      }
+
+      if (statusFilter !== 'all') {
+        query = query.eq('status', statusFilter);
+      }
+
+      if (debouncedSearch.trim()) {
+        query = query.or(
+          `customer_name.ilike.%${debouncedSearch}%,keywords.cs.{${debouncedSearch}}`
+        );
+      }
+
+      query = query.order('visit_time', { ascending: sortOrder === 'asc', nullsFirst: false });
+      // 对visit_time为null的记录按created_at排序
+      query = query.order('created_at', { ascending: sortOrder === 'asc' });
+      query = query.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+
+      const { data, count, error } = await query;
+
+      if (error) throw error;
+      setVisits((data || []) as VisitListItem[]);
+      setTotalCount(count || 0);
+    } finally {
+      setLoading(false);
+    }
+  }, [profile, debouncedSearch, statusFilter, sortOrder, page]);
+
+  useEffect(() => {
+    fetchVisits();
+  }, [fetchVisits]);
+
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+
+  return (
+    <MainLayout>
+      <div className="space-y-5">
+        {/* 标题 */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <FileSearch size={20} className="text-primary" />
+            <h1 className="text-lg font-semibold">拜访报告</h1>
+            <span className="text-sm text-muted-foreground">({totalCount}条)</span>
+          </div>
+          <Button variant="ghost" size="sm" onClick={fetchVisits}
+            className="text-muted-foreground hover:text-foreground h-8 px-2">
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+
+        {/* 搜索和筛选 */}
+        <div className="flex flex-col md:flex-row gap-3">
+          <div className="relative flex-1">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              placeholder="搜索客户名称或关键词..."
+              value={searchKeyword}
+              onChange={e => setSearchKeyword(e.target.value)}
+              className="pl-9 pr-3"
+            />
+          </div>
+          <div className="flex gap-2 shrink-0">
+            <Select value={statusFilter} onValueChange={v => { setStatusFilter(v); setPage(0); }}>
+              <SelectTrigger className="w-28 px-3">
+                <SlidersHorizontal size={12} className="mr-1 text-muted-foreground" />
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部状态</SelectItem>
+                <SelectItem value="preparing">准备中</SelectItem>
+                <SelectItem value="recording">已录音</SelectItem>
+                <SelectItem value="processing">处理中</SelectItem>
+                <SelectItem value="completed">已完成</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={sortOrder} onValueChange={v => { setSortOrder(v as 'desc' | 'asc'); setPage(0); }}>
+              <SelectTrigger className="w-28 px-3">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="desc">最新优先</SelectItem>
+                <SelectItem value="asc">最早优先</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        {/* 报告列表 */}
+        <Card className="border border-border shadow-none">
+          {loading ? (
+            <CardContent className="p-4 space-y-3">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <Skeleton key={i} className="h-16 w-full bg-muted" />
+              ))}
+            </CardContent>
+          ) : visits.length === 0 ? (
+            <CardContent className="py-16 text-center">
+              <FileSearch size={36} className="mx-auto text-muted-foreground/30 mb-3" />
+              <p className="text-sm text-muted-foreground">
+                {debouncedSearch || statusFilter !== 'all' ? '未找到符合条件的拜访记录' : '暂无拜访记录'}
+              </p>
+              {!debouncedSearch && statusFilter === 'all' && (
+                <Link to="/visits/record">
+                  <Button size="sm" className="mt-3">开始第一次拜访</Button>
+                </Link>
+              )}
+            </CardContent>
+          ) : (
+            <div className="divide-y divide-border">
+              {/* 列表头 */}
+              <div className="hidden md:grid grid-cols-[1fr_120px_90px_90px_32px] gap-4 px-4 py-2.5 bg-muted/30">
+                <span className="text-xs font-medium text-muted-foreground">客户信息</span>
+                <span className="text-xs font-medium text-muted-foreground">拜访时间</span>
+                <span className="text-xs font-medium text-muted-foreground">状态</span>
+                <span className="text-xs font-medium text-muted-foreground">操作员</span>
+                <span />
+              </div>
+
+              {visits.map(visit => {
+                const statusConf = STATUS_CONFIG[visit.status] || STATUS_CONFIG.preparing;
+                const visitDate = visit.visit_time
+                  ? format(new Date(visit.visit_time), 'M月d日 HH:mm', { locale: zhCN })
+                  : format(new Date(visit.created_at), 'M月d日', { locale: zhCN }) + ' (创建)';
+
+                return (
+                  <Link
+                    key={visit.id}
+                    to={`/visits/reports/${visit.id}`}
+                    className="flex flex-col md:grid md:grid-cols-[1fr_120px_90px_90px_32px] gap-2 md:gap-4 px-4 py-3.5 hover:bg-muted/30 transition-colors items-start md:items-center"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-medium text-sm text-foreground">{visit.customer_name}</span>
+                        {visit.customer_industry && (
+                          <Badge variant="secondary" className="text-xs">{visit.customer_industry}</Badge>
+                        )}
+                      </div>
+                      {visit.keywords && visit.keywords.length > 0 && (
+                        <div className="flex gap-1 mt-1 flex-wrap">
+                          {visit.keywords.slice(0, 3).map((kw, i) => (
+                            <span key={i} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                              {kw}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-1 text-xs text-muted-foreground whitespace-nowrap">
+                      <Calendar size={11} />
+                      {visitDate}
+                    </div>
+
+                    <div>
+                      <span className={cn('text-xs px-2 py-0.5 rounded font-medium', statusConf.className)}>
+                        {statusConf.label}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                      <User size={11} />
+                      <span className="truncate max-w-[72px]">
+                        {visit.profiles?.full_name || visit.profiles?.username || '-'}
+                      </span>
+                    </div>
+
+                    <ArrowRight size={14} className="text-muted-foreground shrink-0 hidden md:block" />
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
+        {/* 分页 */}
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-muted-foreground">
+              第 {page + 1} / {totalPages} 页，共 {totalCount} 条
+            </span>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPage(p => p - 1)}
+                disabled={page === 0}
+                className="h-8"
+              >
+                <ChevronLeft size={14} />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPage(p => p + 1)}
+                disabled={page >= totalPages - 1}
+                className="h-8"
+              >
+                <ChevronRight size={14} />
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </MainLayout>
+  );
+};
+
+export default VisitReportsPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/VisitReportsPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/VisitReportDetailPage.tsx]
+Thought: Now create the Report Detail page:
+Command: create
+Created File with Text:
+```
+import React, { useEffect, useState } from 'react';
+import { useParams, Link } from 'react-router-dom';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Separator } from '@/components/ui/separator';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import {
+  ArrowLeft, Sparkles, Loader2, FileText, BarChart3, Mic,
+  TrendingUp, AlertCircle, CheckCircle2, Users, Target, Lightbulb,
+  MapPin, Calendar, User, RefreshCw,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { supabase } from '@/db/supabase';
+import type { Visit, StructuredReport } from '@/types/types';
+import { format } from 'date-fns';
+import { zhCN } from 'date-fns/locale';
+import { cn } from '@/lib/utils';
+
+const INTENT_CONFIG = {
+  高: { className: 'text-chart-2 bg-chart-2/10', icon: <TrendingUp size={12} /> },
+  中: { className: 'text-warning bg-warning/10', icon: <Target size={12} /> },
+  低: { className: 'text-muted-foreground bg-muted', icon: <AlertCircle size={12} /> },
+};
+
+const VisitReportDetailPage: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  const [visit, setVisit] = useState<Visit | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [processingTranscript, setProcessingTranscript] = useState(false);
+  const [processingReport, setProcessingReport] = useState(false);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (id) fetchVisit(id);
+  }, [id]);
+
+  const fetchVisit = async (visitId: string) => {
+    setLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('visits')
+        .select('*, profiles!visits_user_id_fkey(username, full_name)')
+        .eq('id', visitId)
+        .maybeSingle();
+      if (error) throw error;
+      if (data) {
+        setVisit(data as Visit);
+
+        // 获取录音文件签名URL
+        if (data.recording_url) {
+          const { data: signedData } = await supabase.storage
+            .from('recordings')
+            .createSignedUrl(data.recording_url, 3600);
+          if (signedData?.signedUrl) setAudioUrl(signedData.signedUrl);
+        }
+      }
+    } catch {
+      toast.error('加载拜访记录失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // AI转写录音
+  const handleTranscribe = async () => {
+    if (!visit?.recording_url || !id) {
+      toast.error('没有可转写的录音文件');
+      return;
+    }
+    setProcessingTranscript(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('transcribe-audio', {
+        body: { visitId: id, recordingPath: visit.recording_url },
+      });
+      if (error) {
+        const msg = await error?.context?.text();
+        throw new Error(msg || error.message);
+      }
+      if (data?.success) {
+        toast.success('转写完成');
+        await fetchVisit(id);
+      } else {
+        throw new Error('转写失败');
+      }
+    } catch (err: unknown) {
+      toast.error(`转写失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setProcessingTranscript(false);
+    }
+  };
+
+  // AI生成报告
+  const handleGenerateReport = async () => {
+    if (!visit?.transcript || !id) {
+      toast.error('请先转写录音生成文字稿');
+      return;
+    }
+    setProcessingReport(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('generate-text', {
+        body: {
+          type: 'report',
+          data: {
+            customerName: visit.customer_name,
+            visitTime: visit.visit_time,
+            visitLocation: visit.visit_location,
+            transcript: visit.transcript,
+          },
+        },
+      });
+      if (error) {
+        const msg = await error?.context?.text();
+        throw new Error(msg || error.message);
+      }
+      if (data?.success && data.data) {
+        const report = data.data as StructuredReport;
+        // 更新数据库
+        await supabase.from('visits').update({
+          structured_report: report,
+          keywords: report.keywords || [],
+          status: 'completed',
+        }).eq('id', id);
+        toast.success('报告生成完成');
+        await fetchVisit(id);
+      } else {
+        throw new Error('报告生成失败');
+      }
+    } catch (err: unknown) {
+      toast.error(`报告生成失败：${err instanceof Error ? err.message : '未知错误'}`);
+    } finally {
+      setProcessingReport(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <MainLayout>
+        <div className="space-y-4 max-w-5xl mx-auto">
+          <Skeleton className="h-8 w-48 bg-muted" />
+          <Skeleton className="h-40 w-full bg-muted" />
+          <Skeleton className="h-80 w-full bg-muted" />
+        </div>
+      </MainLayout>
+    );
+  }
+
+  if (!visit) {
+    return (
+      <MainLayout>
+        <div className="text-center py-20">
+          <p className="text-muted-foreground">找不到拜访记录</p>
+          <Link to="/visits/reports">
+            <Button variant="outline" className="mt-4">返回列表</Button>
+          </Link>
+        </div>
+      </MainLayout>
+    );
+  }
+
+  const report = visit.structured_report;
+  const intentConf = report?.intentLevel ? INTENT_CONFIG[report.intentLevel] : null;
+
+  return (
+    <MainLayout>
+      <div className="max-w-5xl mx-auto space-y-5">
+        {/* 顶部导航 */}
+        <div className="flex items-center gap-3">
+          <Link to="/visits/reports">
+            <Button variant="ghost" size="sm" className="text-muted-foreground hover:text-foreground px-2 h-8">
+              <ArrowLeft size={14} className="mr-1" />返回
+            </Button>
+          </Link>
+          <span className="text-muted-foreground">/</span>
+          <span className="text-sm font-medium text-foreground truncate">{visit.customer_name}</span>
+        </div>
+
+        {/* 基本信息卡片 */}
+        <Card className="border border-border shadow-none">
+          <CardContent className="p-5">
+            <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap mb-2">
+                  <h1 className="text-xl font-semibold text-foreground text-balance">{visit.customer_name}</h1>
+                  {visit.customer_industry && (
+                    <Badge variant="secondary">{visit.customer_industry}</Badge>
+                  )}
+                  <span className={cn(
+                    'text-xs px-2 py-0.5 rounded font-medium',
+                    visit.status === 'completed' ? 'text-chart-2 bg-chart-2/10'
+                      : visit.status === 'recording' ? 'text-primary bg-primary/10'
+                        : visit.status === 'processing' ? 'text-info bg-info/10'
+                          : 'text-warning bg-warning/10'
+                  )}>
+                    {visit.status === 'completed' ? '已完成' : visit.status === 'recording' ? '已录音'
+                      : visit.status === 'processing' ? '处理中' : '准备中'}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap gap-x-4 gap-y-1.5 text-sm text-muted-foreground">
+                  {visit.visit_time && (
+                    <span className="flex items-center gap-1">
+                      <Calendar size={13} />
+                      {format(new Date(visit.visit_time), 'yyyy年M月d日 HH:mm', { locale: zhCN })}
+                    </span>
+                  )}
+                  {visit.visit_location && (
+                    <span className="flex items-center gap-1">
+                      <MapPin size={13} />
+                      {visit.visit_location}
+                    </span>
+                  )}
+                  <span className="flex items-center gap-1">
+                    <User size={13} />
+                    {visit.profiles?.full_name || visit.profiles?.username}
+                  </span>
+                </div>
+
+                {visit.visit_purpose && (
+                  <p className="text-sm text-muted-foreground mt-2">
+                    <span className="text-foreground font-medium">目的：</span>{visit.visit_purpose}
+                  </p>
+                )}
+
+                {visit.keywords && visit.keywords.length > 0 && (
+                  <div className="flex gap-1.5 mt-3 flex-wrap">
+                    {visit.keywords.map((kw, i) => (
+                      <span key={i} className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded">{kw}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* 操作按钮 */}
+              <div className="flex flex-col gap-2 shrink-0">
+                {visit.recording_url && !visit.transcript && (
+                  <Button size="sm" onClick={handleTranscribe} disabled={processingTranscript} className="h-9">
+                    {processingTranscript
+                      ? <><Loader2 size={13} className="mr-2 animate-spin" />转写中...</>
+                      : <><FileText size={13} className="mr-2" />AI转写录音</>}
+                  </Button>
+                )}
+                {visit.transcript && !visit.structured_report && (
+                  <Button size="sm" onClick={handleGenerateReport} disabled={processingReport} className="h-9">
+                    {processingReport
+                      ? <><Loader2 size={13} className="mr-2 animate-spin" />生成中...</>
+                      : <><Sparkles size={13} className="mr-2" />AI生成报告</>}
+                  </Button>
+                )}
+                {visit.structured_report && (
+                  <Button size="sm" variant="outline" onClick={handleGenerateReport} disabled={processingReport} className="h-9">
+                    {processingReport
+                      ? <><Loader2 size={13} className="mr-2 animate-spin" />更新中...</>
+                      : <><RefreshCw size={13} className="mr-2" />重新生成报告</>}
+                  </Button>
+                )}
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 主内容区（标签页） */}
+        <Tabs defaultValue={report ? 'report' : visit.transcript ? 'transcript' : 'info'} className="space-y-4">
+          <TabsList className="grid grid-cols-3 w-full md:w-auto md:inline-grid">
+            <TabsTrigger value="report" className="text-xs gap-1.5">
+              <BarChart3 size={13} />结构化报告
+            </TabsTrigger>
+            <TabsTrigger value="transcript" className="text-xs gap-1.5">
+              <FileText size={13} />文字稿
+            </TabsTrigger>
+            <TabsTrigger value="recording" className="text-xs gap-1.5">
+              <Mic size={13} />原始录音
+            </TabsTrigger>
+          </TabsList>
+
+          {/* 结构化报告 */}
+          <TabsContent value="report">
+            {processingReport ? (
+              <Card className="border border-border shadow-none">
+                <CardContent className="p-8 text-center">
+                  <Loader2 size={32} className="animate-spin text-primary mx-auto mb-3" />
+                  <p className="text-sm text-muted-foreground">AI正在分析拜访内容，生成结构化报告...</p>
+                </CardContent>
+              </Card>
+            ) : report ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* 拜访总结 */}
+                <Card className="border border-border shadow-none md:col-span-2">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <CheckCircle2 size={14} className="text-chart-2" />拜访总结
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    <p className="text-sm text-foreground leading-relaxed text-pretty">{report.summary}</p>
+                  </CardContent>
+                </Card>
+
+                {/* 意向度 */}
+                <Card className="border border-border shadow-none">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <Target size={14} className="text-chart-3" />客户意向
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className={cn('flex items-center gap-1 px-2.5 py-1 rounded text-sm font-medium', intentConf?.className)}>
+                        {intentConf?.icon}{report.intentLevel}意向
+                      </span>
+                    </div>
+                    <p className="text-sm text-muted-foreground text-pretty">{report.intentAnalysis}</p>
+                  </CardContent>
+                </Card>
+
+                {/* 竞争对手 */}
+                <Card className="border border-border shadow-none">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <Users size={14} className="text-chart-4" />竞争对手
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    {report.competitors?.length > 0 ? (
+                      <div className="flex flex-wrap gap-1.5">
+                        {report.competitors.map((c, i) => (
+                          <Badge key={i} variant="secondary">{c}</Badge>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">未提及竞争对手</p>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* 客户需求 */}
+                <Card className="border border-border shadow-none">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <Lightbulb size={14} className="text-chart-3" />客户需求
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    <ul className="space-y-1.5">
+                      {report.customerNeeds?.map((need, i) => (
+                        <li key={i} className="flex items-start gap-2 text-sm">
+                          <span className="text-chart-3 mt-0.5 shrink-0">•</span>
+                          <span className="text-pretty">{need}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </CardContent>
+                </Card>
+
+                {/* 痛点 */}
+                <Card className="border border-border shadow-none">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <AlertCircle size={14} className="text-destructive" />客户痛点
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    <ul className="space-y-1.5">
+                      {report.painPoints?.map((point, i) => (
+                        <li key={i} className="flex items-start gap-2 text-sm">
+                          <span className="text-destructive mt-0.5 shrink-0">•</span>
+                          <span className="text-pretty">{point}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </CardContent>
+                </Card>
+
+                {/* 下一步行动 */}
+                <Card className="border border-border shadow-none md:col-span-2">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <TrendingUp size={14} className="text-primary" />下一步行动建议
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    <div className="space-y-2">
+                      {report.nextActions?.map((action, i) => (
+                        <div key={i} className="flex items-start gap-3 p-2.5 bg-muted/40 rounded">
+                          <span className="text-xs bg-primary text-primary-foreground w-5 h-5 rounded-full flex items-center justify-center shrink-0 font-medium mt-0.5">
+                            {i + 1}
+                          </span>
+                          <span className="text-sm text-pretty">{action}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            ) : (
+              <Card className="border border-border shadow-none">
+                <CardContent className="py-16 text-center">
+                  <BarChart3 size={36} className="mx-auto text-muted-foreground/30 mb-3" />
+                  <p className="text-sm text-muted-foreground">
+                    {visit.transcript ? '点击「AI生成报告」生成结构化分析' : '请先转写录音内容'}
+                  </p>
+                  {visit.transcript && (
+                    <Button size="sm" className="mt-3" onClick={handleGenerateReport} disabled={processingReport}>
+                      <Sparkles size={13} className="mr-2" />生成报告
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+          </TabsContent>
+
+          {/* 文字稿 */}
+          <TabsContent value="transcript">
+            {processingTranscript ? (
+              <Card className="border border-border shadow-none">
+                <CardContent className="p-8 text-center">
+                  <Loader2 size={32} className="animate-spin text-primary mx-auto mb-3" />
+                  <p className="text-sm text-muted-foreground">AI正在转写录音，请稍候...</p>
+                </CardContent>
+              </Card>
+            ) : visit.transcript ? (
+              <div className="space-y-4">
+                {/* 分段文字稿 */}
+                {visit.transcript_utterances && visit.transcript_utterances.length > 0 ? (
+                  <Card className="border border-border shadow-none">
+                    <CardHeader className="pb-2 pt-4 px-5">
+                      <CardTitle className="text-sm font-medium">分句文字稿</CardTitle>
+                    </CardHeader>
+                    <CardContent className="px-5 pb-5 space-y-2">
+                      {visit.transcript_utterances.map((utt, i) => (
+                        <div key={i} className="flex gap-3 text-sm">
+                          <span className="text-xs text-muted-foreground whitespace-nowrap mt-0.5 w-16 shrink-0">
+                            {formatTime(utt.start_time)}
+                          </span>
+                          <span className="text-foreground text-pretty leading-relaxed">{utt.text}</span>
+                        </div>
+                      ))}
+                    </CardContent>
+                  </Card>
+                ) : null}
+
+                {/* 完整文字稿 */}
+                <Card className="border border-border shadow-none">
+                  <CardHeader className="pb-2 pt-4 px-5">
+                    <CardTitle className="text-sm font-medium flex items-center justify-between">
+                      <span>完整文字稿</span>
+                      {visit.recording_url && (
+                        <Button variant="ghost" size="sm" onClick={handleTranscribe} disabled={processingTranscript}
+                          className="text-xs text-muted-foreground hover:text-foreground h-7 px-2">
+                          <RefreshCw size={12} className="mr-1" />重新转写
+                        </Button>
+                      )}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-5 pb-5">
+                    <p className="text-sm text-foreground leading-loose whitespace-pre-wrap text-pretty">
+                      {visit.transcript}
+                    </p>
+                  </CardContent>
+                </Card>
+              </div>
+            ) : (
+              <Card className="border border-border shadow-none">
+                <CardContent className="py-16 text-center">
+                  <FileText size={36} className="mx-auto text-muted-foreground/30 mb-3" />
+                  <p className="text-sm text-muted-foreground">
+                    {visit.recording_url ? '点击「AI转写录音」获取文字稿' : '没有可转写的录音文件'}
+                  </p>
+                  {visit.recording_url && (
+                    <Button size="sm" className="mt-3" onClick={handleTranscribe} disabled={processingTranscript}>
+                      <FileText size={13} className="mr-2" />AI转写录音
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+          </TabsContent>
+
+          {/* 录音文件 */}
+          <TabsContent value="recording">
+            <Card className="border border-border shadow-none">
+              <CardHeader className="pb-2 pt-4 px-5">
+                <CardTitle className="text-sm font-medium flex items-center gap-2">
+                  <Mic size={14} className="text-destructive" />原始录音
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="px-5 pb-5">
+                {audioUrl ? (
+                  <div className="space-y-3">
+                    <audio controls src={audioUrl} className="w-full" />
+                    {visit.recording_name && (
+                      <p className="text-xs text-muted-foreground">
+                        文件：{visit.recording_name}
+                        {visit.recording_duration && ` · 时长：${formatTime(visit.recording_duration * 1000)}`}
+                      </p>
+                    )}
+                    <Separator />
+                    <p className="text-xs text-muted-foreground">
+                      链接有效期1小时，过期后请刷新页面
+                    </p>
+                  </div>
+                ) : visit.recording_url ? (
+                  <div className="text-center py-8">
+                    <Loader2 size={24} className="animate-spin text-muted-foreground mx-auto mb-2" />
+                    <p className="text-sm text-muted-foreground">加载录音...</p>
+                  </div>
+                ) : (
+                  <div className="text-center py-12">
+                    <Mic size={36} className="mx-auto text-muted-foreground/30 mb-3" />
+                    <p className="text-sm text-muted-foreground">暂无录音文件</p>
+                    <Link to="/visits/record">
+                      <Button size="sm" variant="outline" className="mt-3">前往录音</Button>
+                    </Link>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+    </MainLayout>
+  );
+};
+
+// 格式化时间（毫秒 → mm:ss）
+function formatTime(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const m = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+  const s = (totalSeconds % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+export default VisitReportDetailPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/VisitReportDetailPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/AdminUsersPage.tsx]
+Thought: Now create the Admin pages:
+Command: create
+Created File with Text:
+```
+import React, { useEffect, useState, useCallback } from 'react';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from '@/components/ui/select';
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import {
+  Users, Search, ShieldCheck, Shield, UserX, UserCheck, ChevronLeft, ChevronRight, RefreshCw,
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { supabase } from '@/db/supabase';
+import type { Profile } from '@/types/types';
+import { format } from 'date-fns';
+import { zhCN } from 'date-fns/locale';
+import { cn } from '@/lib/utils';
+import { useAuth } from '@/contexts/AuthContext';
+
+const PAGE_SIZE = 15;
+
+const AdminUsersPage: React.FC = () => {
+  const { profile: currentUser } = useAuth();
+  const [users, setUsers] = useState<Profile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [page, setPage] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+
+  useEffect(() => {
+    const timer = setTimeout(() => { setDebouncedSearch(search); setPage(0); }, 400);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  const fetchUsers = useCallback(async () => {
+    setLoading(true);
+    try {
+      let query = supabase
+        .from('profiles')
+        .select('*', { count: 'exact' })
+        .order('created_at', { ascending: false });
+
+      if (debouncedSearch.trim()) {
+        query = query.or(`username.ilike.%${debouncedSearch}%,full_name.ilike.%${debouncedSearch}%`);
+      }
+
+      query = query.range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+      const { data, count, error } = await query;
+      if (error) throw error;
+      setUsers((data || []) as Profile[]);
+      setTotalCount(count || 0);
+    } finally {
+      setLoading(false);
+    }
+  }, [debouncedSearch, page]);
+
+  useEffect(() => { fetchUsers(); }, [fetchUsers]);
+
+  const handleRoleChange = async (userId: string, newRole: 'user' | 'admin') => {
+    if (userId === currentUser?.id) {
+      toast.error('不能修改自己的角色');
+      return;
+    }
+    setActionLoading(userId);
+    try {
+      const { error } = await supabase
+        .from('profiles')
+        .update({ role: newRole })
+        .eq('id', userId);
+      if (error) throw error;
+      setUsers(prev => prev.map(u => u.id === userId ? { ...u, role: newRole } : u));
+      toast.success(`角色已更新为${newRole === 'admin' ? '管理员' : '普通用户'}`);
+    } catch {
+      toast.error('角色更新失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleToggleActive = async (userId: string, currentActive: boolean) => {
+    if (userId === currentUser?.id) {
+      toast.error('不能禁用自己的账号');
+      return;
+    }
+    setActionLoading(userId);
+    try {
+      const { error } = await supabase
+        .from('profiles')
+        .update({ is_active: !currentActive })
+        .eq('id', userId);
+      if (error) throw error;
+      setUsers(prev => prev.map(u => u.id === userId ? { ...u, is_active: !currentActive } : u));
+      toast.success(!currentActive ? '账号已启用' : '账号已禁用');
+    } catch {
+      toast.error('操作失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
+
+  return (
+    <MainLayout>
+      <div className="space-y-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Users size={20} className="text-primary" />
+            <h1 className="text-lg font-semibold">用户管理</h1>
+            <span className="text-sm text-muted-foreground">({totalCount}人)</span>
+          </div>
+          <Button variant="ghost" size="sm" onClick={fetchUsers}
+            className="text-muted-foreground hover:text-foreground h-8 px-2">
+            <RefreshCw size={14} />
+          </Button>
+        </div>
+
+        {/* 搜索 */}
+        <div className="relative max-w-xs">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            placeholder="搜索用户名或姓名..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="pl-9 pr-3"
+          />
+        </div>
+
+        {/* 用户列表 */}
+        <Card className="border border-border shadow-none">
+          {loading ? (
+            <CardContent className="p-4 space-y-3">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <Skeleton key={i} className="h-12 w-full bg-muted" />
+              ))}
+            </CardContent>
+          ) : users.length === 0 ? (
+            <CardContent className="py-16 text-center">
+              <Users size={36} className="mx-auto text-muted-foreground/30 mb-3" />
+              <p className="text-sm text-muted-foreground">未找到用户</p>
+            </CardContent>
+          ) : (
+            <>
+              {/* 表头 */}
+              <div className="hidden md:grid grid-cols-[1fr_80px_80px_100px_120px] gap-4 px-4 py-2.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
+                <span>用户</span>
+                <span>角色</span>
+                <span>状态</span>
+                <span>注册时间</span>
+                <span>操作</span>
+              </div>
+
+              <div className="divide-y divide-border">
+                {users.map(user => (
+                  <div key={user.id}
+                    className={cn(
+                      'flex flex-col md:grid md:grid-cols-[1fr_80px_80px_100px_120px] gap-2 md:gap-4 px-4 py-3.5 items-start md:items-center',
+                      !user.is_active && 'opacity-60'
+                    )}>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-sm">{user.full_name || user.username}</span>
+                        {user.id === currentUser?.id && (
+                          <Badge variant="secondary" className="text-xs">我</Badge>
+                        )}
+                      </div>
+                      <span className="text-xs text-muted-foreground">@{user.username}</span>
+                    </div>
+
+                    <div>
+                      <Select
+                        value={user.role}
+                        onValueChange={v => handleRoleChange(user.id, v as 'user' | 'admin')}
+                        disabled={!!actionLoading || user.id === currentUser?.id}
+                      >
+                        <SelectTrigger className="h-7 text-xs px-2 w-24">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="user">普通用户</SelectItem>
+                          <SelectItem value="admin">管理员</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+
+                    <div>
+                      <span className={cn(
+                        'text-xs px-2 py-0.5 rounded font-medium',
+                        user.is_active ? 'text-chart-2 bg-chart-2/10' : 'text-muted-foreground bg-muted'
+                      )}>
+                        {user.is_active ? '正常' : '已禁用'}
+                      </span>
+                    </div>
+
+                    <div className="text-xs text-muted-foreground whitespace-nowrap">
+                      {format(new Date(user.created_at), 'M月d日', { locale: zhCN })}
+                    </div>
+
+                    <div>
+                      {user.id !== currentUser?.id && (
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              disabled={!!actionLoading}
+                              className={cn(
+                                'h-7 px-2 text-xs',
+                                user.is_active
+                                  ? 'text-destructive hover:text-destructive hover:bg-destructive/10'
+                                  : 'text-chart-2 hover:text-chart-2 hover:bg-chart-2/10'
+                              )}
+                            >
+                              {user.is_active
+                                ? <><UserX size={12} className="mr-1" />禁用</>
+                                : <><UserCheck size={12} className="mr-1" />启用</>}
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent className="max-w-[calc(100%-2rem)] md:max-w-lg">
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>
+                                {user.is_active ? '确认禁用账号' : '确认启用账号'}
+                              </AlertDialogTitle>
+                              <AlertDialogDescription>
+                                {user.is_active
+                                  ? `禁用后，用户 ${user.full_name || user.username} 将无法登录系统。`
+                                  : `启用后，用户 ${user.full_name || user.username} 可以正常登录系统。`}
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>取消</AlertDialogCancel>
+                              <AlertDialogAction
+                                onClick={() => handleToggleActive(user.id, user.is_active)}
+                                className={user.is_active ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90' : ''}
+                              >
+                                确认{user.is_active ? '禁用' : '启用'}
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </Card>
+
+        {/* 分页 */}
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-muted-foreground">第 {page + 1} / {totalPages} 页</span>
+            <div className="flex gap-2">
+              <Button variant="outline" size="sm" onClick={() => setPage(p => p - 1)} disabled={page === 0} className="h-8">
+                <ChevronLeft size={14} />
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setPage(p => p + 1)} disabled={page >= totalPages - 1} className="h-8">
+                <ChevronRight size={14} />
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </MainLayout>
+  );
+};
+
+export default AdminUsersPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/AdminUsersPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/pages/AdminStatsPage.tsx]
+Thought: 
+Command: create
+Created File with Text:
+```
+import React, { useEffect, useState } from 'react';
+import { MainLayout } from '@/components/layouts/MainLayout';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Badge } from '@/components/ui/badge';
+import {
+  BarChart3, Users, Calendar, TrendingUp, CheckCircle2,
+  RefreshCw, ArrowRight, User, Clock,
+} from 'lucide-react';
+import { supabase } from '@/db/supabase';
+import type { VisitListItem, Profile } from '@/types/types';
+import { format, startOfMonth, endOfMonth, subMonths } from 'date-fns';
+import { zhCN } from 'date-fns/locale';
+import { Link } from 'react-router-dom';
+import { cn } from '@/lib/utils';
+
+interface UserStats {
+  profile: Profile;
+  totalVisits: number;
+  completedVisits: number;
+  thisMonthVisits: number;
+}
+
+const AdminStatsPage: React.FC = () => {
+  const [loading, setLoading] = useState(true);
+  const [dateRange, setDateRange] = useState({
+    start: format(startOfMonth(subMonths(new Date(), 2)), 'yyyy-MM-dd'),
+    end: format(endOfMonth(new Date()), 'yyyy-MM-dd'),
+  });
+
+  const [overallStats, setOverallStats] = useState({
+    totalVisits: 0,
+    completedVisits: 0,
+    totalUsers: 0,
+    totalCustomers: 0,
+  });
+  const [userStats, setUserStats] = useState<UserStats[]>([]);
+  const [recentVisits, setRecentVisits] = useState<VisitListItem[]>([]);
+
+  const fetchStats = async () => {
+    setLoading(true);
+    try {
+      const startDate = new Date(dateRange.start).toISOString();
+      const endDate = new Date(dateRange.end + 'T23:59:59').toISOString();
+
+      // 全部拜访数据（日期范围内）
+      const { data: allVisits } = await supabase
+        .from('visits')
+        .select('id, user_id, customer_name, status, visit_time, created_at')
+        .gte('created_at', startDate)
+        .lte('created_at', endDate);
+
+      // 所有用户
+      const { data: allUsers } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('is_active', true)
+        .order('created_at', { ascending: false });
+
+      if (allVisits && allUsers) {
+        const uniqueCustomers = new Set(allVisits.map(v => v.customer_name));
+
+        setOverallStats({
+          totalVisits: allVisits.length,
+          completedVisits: allVisits.filter(v => v.status === 'completed').length,
+          totalUsers: allUsers.length,
+          totalCustomers: uniqueCustomers.size,
+        });
+
+        // 按用户统计
+        const stats: UserStats[] = allUsers
+          .filter(u => u.role === 'user' || u.role === 'admin')
+          .map(user => {
+            const userVisits = allVisits.filter(v => v.user_id === user.id);
+            const now = new Date();
+            const thisMonthStart = startOfMonth(now);
+            return {
+              profile: user as Profile,
+              totalVisits: userVisits.length,
+              completedVisits: userVisits.filter(v => v.status === 'completed').length,
+              thisMonthVisits: userVisits.filter(v => new Date(v.created_at) >= thisMonthStart).length,
+            };
+          })
+          .filter(s => s.totalVisits > 0)
+          .sort((a, b) => b.totalVisits - a.totalVisits);
+
+        setUserStats(stats);
+      }
+
+      // 最近10条拜访记录
+      const { data: recent } = await supabase
+        .from('visits')
+        .select('id, user_id, customer_name, customer_industry, visit_time, status, keywords, transcript, structured_report, created_at, profiles!visits_user_id_fkey(username, full_name)')
+        .order('created_at', { ascending: false })
+        .limit(10);
+      if (recent) setRecentVisits(recent as VisitListItem[]);
+
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { fetchStats(); }, []);
+
+  const STATUS_CONFIG = {
+    preparing: { label: '准备中', className: 'text-warning bg-warning/10' },
+    recording: { label: '已录音', className: 'text-primary bg-primary/10' },
+    processing: { label: '处理中', className: 'text-info bg-info/10' },
+    completed: { label: '已完成', className: 'text-chart-2 bg-chart-2/10' },
+  };
+
+  return (
+    <MainLayout>
+      <div className="space-y-6">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-2">
+            <BarChart3 size={20} className="text-primary" />
+            <h1 className="text-lg font-semibold">拜访数据统计</h1>
+          </div>
+
+          {/* 日期范围筛选 */}
+          <div className="flex items-center gap-2 text-sm">
+            <Input
+              type="date"
+              value={dateRange.start}
+              onChange={e => setDateRange(prev => ({ ...prev, start: e.target.value }))}
+              className="h-8 px-2 text-xs w-36"
+            />
+            <span className="text-muted-foreground">至</span>
+            <Input
+              type="date"
+              value={dateRange.end}
+              onChange={e => setDateRange(prev => ({ ...prev, end: e.target.value }))}
+              className="h-8 px-2 text-xs w-36"
+            />
+            <Button size="sm" className="h-8" onClick={fetchStats} disabled={loading}>
+              {loading ? <RefreshCw size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+            </Button>
+          </div>
+        </div>
+
+        {/* 全局统计 */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {[
+            { icon: <BarChart3 size={18} className="text-primary" />, label: '拜访总次数', value: overallStats.totalVisits },
+            { icon: <CheckCircle2 size={18} className="text-chart-2" />, label: '已完成报告', value: overallStats.completedVisits },
+            { icon: <Users size={18} className="text-chart-3" />, label: '活跃用户数', value: overallStats.totalUsers },
+            { icon: <TrendingUp size={18} className="text-chart-4" />, label: '累计客户数', value: overallStats.totalCustomers },
+          ].map((item, idx) => (
+            <Card key={idx} className="border border-border shadow-none h-full">
+              <CardContent className="p-4 flex flex-col h-full">
+                <div className="flex items-center gap-2 mb-2">
+                  {item.icon}
+                  <span className="text-xs text-muted-foreground">{item.label}</span>
+                </div>
+                {loading ? (
+                  <Skeleton className="h-7 w-12 bg-muted" />
+                ) : (
+                  <div className="text-2xl font-semibold text-foreground">{item.value}</div>
+                )}
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* 各用户拜访统计 */}
+          <Card className="border border-border shadow-none h-full flex flex-col">
+            <CardHeader className="pb-2 pt-4 px-5">
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <User size={14} className="text-primary" />各销售拜访统计
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="px-5 pb-5 flex-1">
+              {loading ? (
+                <div className="space-y-3">
+                  {[1, 2, 3].map(i => <Skeleton key={i} className="h-10 w-full bg-muted" />)}
+                </div>
+              ) : userStats.length === 0 ? (
+                <div className="text-center py-8 text-sm text-muted-foreground">
+                  所选时间段内暂无数据
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {userStats.map((stat, idx) => {
+                    const completionRate = stat.totalVisits > 0
+                      ? Math.round(stat.completedVisits / stat.totalVisits * 100)
+                      : 0;
+                    return (
+                      <div key={stat.profile.id} className="flex items-center gap-3">
+                        <span className="text-sm font-medium text-muted-foreground w-5 shrink-0">
+                          {idx + 1}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-sm font-medium truncate">
+                              {stat.profile.full_name || stat.profile.username}
+                            </span>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="text-xs text-muted-foreground">{completionRate}%完成</span>
+                              <span className="text-sm font-semibold text-primary">{stat.totalVisits}次</span>
+                            </div>
+                          </div>
+                          <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-primary rounded-full transition-all"
+                              style={{ width: `${completionRate}%` }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* 最近拜访记录 */}
+          <Card className="border border-border shadow-none h-full flex flex-col">
+            <CardHeader className="pb-2 pt-4 px-5 flex flex-row items-center justify-between">
+              <CardTitle className="text-sm font-medium flex items-center gap-2">
+                <Clock size={14} className="text-primary" />最近拜访记录
+              </CardTitle>
+              <Link to="/visits/reports" className="text-xs text-primary hover:underline flex items-center gap-1">
+                查看全部 <ArrowRight size={11} />
+              </Link>
+            </CardHeader>
+            <CardContent className="px-0 pb-0 flex-1">
+              {loading ? (
+                <div className="px-5 space-y-3">
+                  {[1, 2, 3, 4].map(i => <Skeleton key={i} className="h-10 w-full bg-muted" />)}
+                </div>
+              ) : recentVisits.length === 0 ? (
+                <div className="text-center py-8 text-sm text-muted-foreground px-5">暂无记录</div>
+              ) : (
+                <div className="divide-y divide-border">
+                  {recentVisits.map(visit => {
+                    const statusConf = STATUS_CONFIG[visit.status] || STATUS_CONFIG.preparing;
+                    return (
+                      <Link
+                        key={visit.id}
+                        to={`/visits/reports/${visit.id}`}
+                        className="flex items-center gap-3 px-5 py-2.5 hover:bg-muted/30 transition-colors"
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-sm font-medium truncate">{visit.customer_name}</span>
+                          </div>
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground mt-0.5">
+                            <User size={10} />
+                            <span>{visit.profiles?.full_name || visit.profiles?.username}</span>
+                            <Calendar size={10} />
+                            <span>
+                              {format(new Date(visit.visit_time || visit.created_at), 'M/d', { locale: zhCN })}
+                            </span>
+                          </div>
+                        </div>
+                        <span className={cn('text-xs px-1.5 py-0.5 rounded shrink-0', statusConf.className)}>
+                          {statusConf.label}
+                        </span>
+                      </Link>
+                    );
+                  })}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </MainLayout>
+  );
+};
+
+export default AdminStatsPage;
+
+```
+
+</action>
+<observation>
+File created successfully at: /workspace/app-bcuf7wultloh/src/pages/AdminStatsPage.tsx
+
+</observation>
+<action>
+**FileEditAction**
+Path: [/workspace/app-bcuf7wultloh/src/routes.tsx]
+Thought: Now update the routes and App.tsx:
+Command: str_replace
+Old String: ```
+import SamplePage from './pages/SamplePage';
+import type { ReactNode } from 'react';
+
+export interface RouteConfig {
+  name: string;
+  path: string;
+  element: ReactNode;
+  visible?: boolean;
+  /** Accessible without login. Routes without this flag require authentication. Has no effect when RouteGuard is not in use. */
+  public?: boolean;
+}
+
+export const routes: RouteConfig[] = [
+  {
+    name: 'Sample Page',
+    path: '/',
+    element: <SamplePage />,
+    public: true,
+  }
+];
+```
+New String: ```
+import type { ReactNode } from 'react';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+import HomePage from './pages/HomePage';
+import VisitPreparePage from './pages/VisitPreparePage';
+import VisitRecordPage from './pages/VisitRecordPage';
+import VisitReportsPage from './pages/VisitReportsPage';
+import VisitReportDetailPage from './pages/VisitReportDetailPage';
+import AdminUsersPage from './pages/AdminUsersPage';
+import AdminStatsPage from './pages/AdminStatsPage';
+
+export interface RouteConfig {
+  name: string;
+  path: string;
+  element: ReactNode;
+  visible?: boolean;
+  /** Accessible without login. Routes without this flag require authentication. Has no effect when RouteGuard is not in use. */
+  public?: boolean;
+}
+
+export const routes: RouteConfig[] = [
+  { name: '登录', path: '/login', element: <LoginPage />, public: true },
+  { name: '注册', path: '/register', element: <RegisterPage />, public: true },
+  { name: '首页', path: '/', element: <HomePage /> },
+  { name: '拜访前准备', path: '/visits/prepare', element: <VisitPreparePage /> },
+  { name: '拜访中记录', path: '/visits/record', element: <VisitRecordPage /> },
+  { name: '拜访报告', path: '/visits/reports', element: <VisitReportsPage /> },
+  { name: '报告详情', path: '/visits/reports/:id', element: <VisitReportDetailPage /> },
+  { name: '用户管理', path: '/admin/users', element: <AdminUsersPage /> },
+  { name: '数据统计', path: '/admin/stats', element: <AdminStatsPage /> },
+];
+```
+
+</action>
+<observation>
+The file /workspace/app-bcuf7wultloh/src/routes.tsx has been edited.
+
+</observation>

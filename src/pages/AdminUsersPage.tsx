@@ -13,7 +13,10 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 import {
-  Users, Search, ShieldCheck, Shield, UserX, UserCheck, ChevronLeft, ChevronRight, RefreshCw,
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter,
+} from '@/components/ui/dialog';
+import {
+  Users, Search, ShieldCheck, Shield, UserX, UserCheck, ChevronLeft, ChevronRight, RefreshCw, Key,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { supabase } from '@/db/supabase';
@@ -34,6 +37,10 @@ const AdminUsersPage: React.FC = () => {
   const [page, setPage] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
+  const [selectedUser, setSelectedUser] = useState<Profile | null>(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
 
   useEffect(() => {
     const timer = setTimeout(() => { setDebouncedSearch(search); setPage(0); }, 400);
@@ -106,6 +113,41 @@ const AdminUsersPage: React.FC = () => {
     }
   };
 
+  const handleUpdatePassword = async () => {
+    if (!selectedUser || !newPassword.trim()) {
+      toast.error('请输入新密码');
+      return;
+    }
+    if (newPassword.length < 6) {
+      toast.error('密码长度至少为6位');
+      return;
+    }
+
+    setIsUpdatingPassword(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('admin-api', {
+        body: {
+          action: 'update-password',
+          userId: selectedUser.id,
+          password: newPassword
+        }
+      });
+
+      if (error) throw error;
+      if (data?.error) throw new Error(data.error);
+
+      toast.success('密码修改成功');
+      setPasswordDialogOpen(false);
+      setNewPassword('');
+      setSelectedUser(null);
+    } catch (err: any) {
+      console.error('Update password error:', err);
+      toast.error(err.message || '密码修改失败');
+    } finally {
+      setIsUpdatingPassword(false);
+    }
+  };
+
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
 
   return (
@@ -150,7 +192,7 @@ const AdminUsersPage: React.FC = () => {
           ) : (
             <>
               {/* 表头 */}
-              <div className="hidden md:grid grid-cols-[1fr_80px_80px_100px_120px] gap-4 px-4 py-2.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
+              <div className="hidden md:grid grid-cols-[1fr_80px_80px_100px_140px] gap-4 px-4 py-2.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
                 <span>用户</span>
                 <span>角色</span>
                 <span>状态</span>
@@ -162,7 +204,7 @@ const AdminUsersPage: React.FC = () => {
                 {users.map(user => (
                   <div key={user.id}
                     className={cn(
-                      'flex flex-col md:grid md:grid-cols-[1fr_80px_80px_100px_120px] gap-2 md:gap-4 px-4 py-3.5 items-start md:items-center',
+                      'flex flex-col md:grid md:grid-cols-[1fr_80px_80px_100px_140px] gap-2 md:gap-4 px-4 py-3.5 items-start md:items-center',
                       !user.is_active && 'opacity-60'
                     )}>
                     <div className="min-w-0">
@@ -204,7 +246,20 @@ const AdminUsersPage: React.FC = () => {
                       {format(new Date(user.created_at), 'M月d日', { locale: zhCN })}
                     </div>
 
-                    <div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs text-primary hover:text-primary hover:bg-primary/10"
+                        onClick={() => {
+                          setSelectedUser(user);
+                          setPasswordDialogOpen(true);
+                        }}
+                      >
+                        <Key size={12} className="mr-1" />
+                        密码
+                      </Button>
+
                       {user.id !== currentUser?.id && (
                         <AlertDialog>
                           <AlertDialogTrigger asChild>
@@ -254,6 +309,41 @@ const AdminUsersPage: React.FC = () => {
             </>
           )}
         </Card>
+
+        {/* 修改密码对话框 */}
+        <Dialog open={passwordDialogOpen} onOpenChange={setPasswordDialogOpen}>
+          <DialogContent className="max-w-[calc(100%-2rem)] md:max-w-md">
+            <DialogHeader>
+              <DialogTitle>修改用户密码</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4 py-4">
+              <div className="space-y-1">
+                <p className="text-sm font-medium">用户</p>
+                <p className="text-sm text-muted-foreground">
+                  {selectedUser?.full_name || selectedUser?.username} (@{selectedUser?.username})
+                </p>
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-medium">新密码</p>
+                <Input
+                  type="password"
+                  placeholder="请输入至少6位新密码"
+                  value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setPasswordDialogOpen(false)} disabled={isUpdatingPassword}>
+                取消
+              </Button>
+              <Button onClick={handleUpdatePassword} disabled={isUpdatingPassword}>
+                {isUpdatingPassword ? '更新中...' : '确认更新'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         {/* 分页 */}
         {totalPages > 1 && (
