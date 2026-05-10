@@ -70,18 +70,18 @@ serve(async (req) => {
       // Get visit details to find recording path
       const { data: visit, error: fetchError } = await supabaseClient
         .from('visits')
-        .select('recording_path')
+        .select('recording_url')
         .eq('id', visitId)
         .single()
 
       if (fetchError) throw fetchError
 
       // Delete from storage if path exists
-      if (visit?.recording_path) {
+      if (visit?.recording_url) {
         const { error: storageError } = await supabaseClient
           .storage
           .from('recordings')
-          .remove([visit.recording_path])
+          .remove([visit.recording_url])
         // We don't throw here to avoid blocking DB deletion if file is already gone
         if (storageError) console.error('Storage deletion error:', storageError)
       }
